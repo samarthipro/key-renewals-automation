@@ -5,11 +5,14 @@
 # Local credentials / config
 .env
 
-# Saved authenticated browser session (contains login cookies/tokens!)
+# Saved authenticated browser state (contains login cookies/tokens!)
 storage_state.json
 *.storage_state.json
+epic_session_storage.json
+*.session_storage.json
+.epic-browser-profile/
 
-# Playwright persistent browser profile (if used)
+# Legacy Playwright profile name
 .pw-profile/
 
 # Downloaded documents and workbooks (may contain client/payroll data)
