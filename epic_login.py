@@ -142,48 +142,55 @@ def main():
 
         print("\n" + "=" * 70)
         print(" ACTION REQUIRED IN THE BROWSER WINDOW:")
-        print("   1. Confirm/submit your login (credentials may be pre-filled).")
-        print("   2. Approve the PUSH NOTIFICATION on your phone when prompted.")
-        print("   3. Wait until you reach the Applied Epic home screen.")
-        print(f"\n You have {config.LOGIN_TIMEOUT_SECONDS} seconds.")
-        print(" When you SEE that you are fully logged in, come back here")
-        print(" and press ENTER to save the session.")
+        print("   1. Click 'Login' if it is still showing.")
+        print("   2. Enter your credentials and approve the PUSH / Okta prompt.")
+        print("   3. Keep going until you reach the Applied Epic HOME screen")
+        print("      (the one with the 'Locate' button in the top toolbar).")
+        print("\n DO NOT touch this terminal. The script will AUTOMATICALLY")
+        print(" detect when you are logged in and then save the session.")
+        print(f" It will wait up to {config.LOGIN_TIMEOUT_SECONDS} seconds.")
         print("=" * 70 + "\n")
 
-        # Wait for the user to confirm they are logged in. We also keep the
-        # browser responsive during the wait.
-        try:
-            input("Press ENTER once you are logged in and on the Epic home screen... ")
-        except KeyboardInterrupt:
-            log("Cancelled by user. No session saved.")
+        # Automatically poll until the HOME screen (Locate toolbar) appears on
+        # ANY tab in the context. This replaces the fragile 'press ENTER' step,
+        # which could fire early and save a logged-OUT session.
+        import time
+        deadline = time.time() + config.LOGIN_TIMEOUT_SECONDS
+        logged_in = False
+        main_page = context.pages[0]
+
+        while time.time() < deadline:
+            for pg in list(context.pages):
+                try:
+                    if pg.get_by_title("Locate (F2)").locator("i").is_visible(timeout=800):
+                        main_page = pg
+                        logged_in = True
+                        break
+                except Exception:
+                    continue
+            if logged_in:
+                break
+            log("Waiting for the Epic home screen (Locate toolbar)...")
+            try:
+                main_page.wait_for_timeout(3000)
+            except Exception:
+                time.sleep(3)
+
+        if not logged_in:
+            log("TIMED OUT waiting for the Epic home screen. Session NOT saved.")
+            log("Re-run and make sure you reach the home screen (Locate toolbar)")
+            log("before the timeout. You can increase LOGIN_TIMEOUT_SECONDS in .env.")
             browser.close()
             sys.exit(1)
 
-        # Bring focus back to the MAIN Epic tab (login may have used a popup).
-        main_page = context.pages[0]
+        log("Confirmed: logged in (Locate toolbar is visible).")
+
+        # Let the SPA finish writing auth state to localStorage before saving.
         try:
             main_page.bring_to_front()
-            # Reload so the SPA picks up the freshly stored auth token, then
-            # give it time to land on the home screen and write localStorage.
-            main_page.reload(wait_until="domcontentloaded")
-            main_page.wait_for_timeout(5000)
+            main_page.wait_for_timeout(3000)
         except Exception:
             pass
-
-        # Verify we are actually logged in before saving (Locate toolbar shows
-        # only when authenticated). Warn - but still save - if we cannot see it.
-        logged_in = False
-        try:
-            logged_in = main_page.get_by_title("Locate (F2)").locator("i").is_visible(timeout=8000)
-        except Exception:
-            logged_in = False
-
-        if logged_in:
-            log("Confirmed: logged in (Locate toolbar is visible).")
-        else:
-            log("WARNING: could not confirm the logged-in home screen.")
-            log("Saving anyway, but if the fetch script shows the login page,")
-            log("re-run this login and make sure you reach the Epic home screen first.")
 
         # Save the authenticated session (cookies + localStorage) from the
         # context, which covers all tabs/pages.
