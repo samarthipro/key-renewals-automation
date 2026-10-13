@@ -166,12 +166,10 @@ def locate_client(page):
 
 def open_documents_section(page):
     """
-    Open the sidebar section that holds the documents (e.g. 'Attachments').
-
-    TODO: confirm which section you want - the sidebar in your screenshot has
-    Attachments, Proofs of Insurance, Policies, etc. Set SECTION below.
+    Open the 'Policies' section from the left sidebar. This opens the next
+    page where the policy documents live (further steps to be added).
     """
-    SECTION = "Attachments"  # change to the section you need
+    SECTION = "Policies"
     for selector in (f"text={SECTION}", f"a:has-text('{SECTION}')"):
         try:
             el = page.locator(selector).first
@@ -194,6 +192,20 @@ def navigate_and_download(page):
     """
     locate_client(page)
     open_documents_section(page)
+
+    # We have opened the 'Policies' page. The next steps (which policy to open
+    # and how to download) are not defined yet, so pause here and keep the
+    # browser open so you can observe the Policies page and describe the next
+    # step. Set STOP_AFTER_POLICIES = False once the download steps are added.
+    STOP_AFTER_POLICIES = True
+    if STOP_AFTER_POLICIES:
+        log("Reached the 'Policies' page. Pausing here so you can inspect it.")
+        log("Describe the next step, and press ENTER to close the browser.")
+        try:
+            input("Press ENTER to finish... ")
+        except (KeyboardInterrupt, EOFError):
+            pass
+        return []
 
     downloaded = []
 
