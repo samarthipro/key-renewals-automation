@@ -48,6 +48,16 @@ DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", BASE_DIR / "downloads"))
 # The client/account to search for in Epic's "Locate" screen.
 CLIENT_NAME = os.getenv("CLIENT_NAME", "LOTUS HR")
 
+# The lookup code of the account result row to open (from the Locate results).
+LOOKUP_CODE = os.getenv("LOOKUP_CODE", "LOTUHRI-01")
+
+# The policy code to open under the client's Policies list.
+POLICY_CODE = os.getenv("POLICY_CODE", "KEYPEO00688800")
+
+# The attachment (document) name to download under the policy's Attachments.
+# Leave blank to download EVERY attachment listed for the policy.
+ATTACHMENT_NAME = os.getenv("ATTACHMENT_NAME", "")
+
 # Behaviour toggles.
 LOGIN_TIMEOUT_SECONDS = int(os.getenv("LOGIN_TIMEOUT_SECONDS", "300"))
 HEADLESS = os.getenv("HEADLESS", "false").strip().lower() in ("1", "true", "yes")

@@ -1,30 +1,30 @@
 """
-STEP 2: Fetch documents from Applied Epic using the saved session.
+STEP 2: Fetch policy documents from Applied Epic using the saved session.
 
 What it does
 ------------
 1. Loads the authenticated session saved by epic_login.py (storage_state.json),
    so Epic treats you as already logged in - no push notification needed.
-2. Opens Epic, verifies the session is still valid (not expired).
-3. Navigates to the document location(s) you configure in navigate_and_download()
-   and downloads the files into DOWNLOAD_DIR.
+2. Opens Epic and verifies the session is still valid (not expired).
+3. Follows the recorded navigation flow:
+      Locate -> search client -> open account -> Policies -> open policy
+      -> Access -> Attachments -> open attachment -> Download
+4. Saves downloaded files into DOWNLOAD_DIR.
 
 If the saved session has EXPIRED, the script tells you to re-run epic_login.py.
 
-IMPORTANT - this part needs YOUR tenant's specifics
----------------------------------------------------
-Every Applied Epic account organises documents differently (by client /
-account / policy / attachments). The navigate_and_download() function below is
-where you tell Playwright how to reach YOUR documents. It ships with a generic
-"click every download link on the page" fallback plus clearly marked TODOs.
-To tailor it precisely, run with HEADLESS=false, watch the browser, and adjust
-the selectors. (Tip: use `python -m playwright codegen` to record clicks.)
+Configurable values (via .env):
+    CLIENT_NAME     - client to search for         (e.g. LOTUS HR)
+    LOOKUP_CODE     - account result row to open    (e.g. LOTUHRI-01)
+    POLICY_CODE     - policy to open                (e.g. KEYPEO00688800)
+    ATTACHMENT_NAME - specific attachment to grab; blank = download all
 
 Run:
     python epic_fetch_documents.py
 """
 
 from datetime import datetime
+import re
 import sys
 
 import epic_config as config
@@ -43,16 +43,10 @@ def log(message):
 
 
 def session_is_valid(page):
-    """
-    Heuristic check: are we logged in, or were we bounced to a login screen?
-
-    We look for a visible password field or a 'Sign in' control as a sign the
-    session expired. Adjust these if your tenant's login page differs.
-    """
+    """Return False if Epic bounced us back to a login screen (expired session)."""
     login_markers = [
         "input[type='password']",
-        "text=/sign in/i",
-        "text=/log in/i",
+        "button:has-text('Login')",
     ]
     for selector in login_markers:
         try:
@@ -81,179 +75,138 @@ def save_download(download, index):
 
 def locate_client(page):
     """
-    Use Epic's 'Locate' screen to search for the client and open the account.
+    Locate -> search client by name -> open the matching account row.
 
-    Mirrors the manual flow:
-      1. Click 'Locate' in the top toolbar.
-      2. In the Locate Criteria panel, type the client name into
-         'Account/Business name contains'.
-      3. Click the blue 'Locate' button.
-      4. Click the matching result row to open the account.
-
-    Applied Epic's markup varies, so each step tries several selectors and
-    falls back gracefully. Run with HEADLESS=false to watch it work, and
-    refine selectors using the codegen recorder if a step misses.
+    Selectors come from a recorded Playwright session of the real flow.
     """
     client = config.CLIENT_NAME
     log(f"Locating client: {client!r}")
 
-    # --- Step 1: open the Locate screen ---
-    for selector in ("text=Locate", "a:has-text('Locate')", "button:has-text('Locate')"):
+    # Open the Locate screen (toolbar button titled 'Locate (F2)').
+    page.get_by_title("Locate (F2)").locator("i").click()
+    page.wait_for_timeout(1500)
+
+    # Type the client name into the first textbox and press Enter.
+    search_box = page.get_by_role("textbox").first
+    search_box.click()
+    search_box.fill(client)
+    search_box.press("Enter")
+    log("Submitted the client search.")
+    page.wait_for_timeout(3000)
+
+    # Open the matching result row - prefer the lookup code, else the name.
+    lookup_code = config.LOOKUP_CODE
+    opened = False
+    if lookup_code:
         try:
-            el = page.locator(selector).first
-            if el.is_visible(timeout=3000):
-                el.click()
-                log(f"Clicked 'Locate' ({selector}).")
-                break
-        except Exception:
-            continue
+            row = page.locator("div").filter(
+                has_text=re.compile(rf"^{re.escape(lookup_code)}$")
+            ).nth(1)
+            row.click()
+            log(f"Opened account by lookup code: {lookup_code}")
+            opened = True
+        except Exception as exc:
+            log(f"Could not open by lookup code ({exc}); trying client name.")
+
+    if not opened:
+        page.get_by_text(client).first.click()
+        log(f"Opened account by name: {client}")
+
+    page.wait_for_timeout(3000)
+
+
+def open_policy_attachments(page):
+    """
+    Policies -> open policy -> Access -> Attachments.
+
+    Reaches the attachment list for the configured policy.
+    """
+    # Click the 'Policies' link in the account sidebar.
+    page.locator("a").filter(has_text="Policies").click()
+    log("Opened the Policies section.")
+    page.wait_for_timeout(3000)
+
+    # Open the specific policy row by its code.
+    policy_code = config.POLICY_CODE
+    page.get_by_text(policy_code).click()
+    log(f"Opened policy: {policy_code}")
     page.wait_for_timeout(2000)
 
-    # --- Step 2: type the client name into the 'contains' field ---
-    search_selectors = [
-        "input[name*='contains' i]",
-        "input[id*='contains' i]",
-        "input[placeholder*='name' i]",
-        "input[type='text']",
-    ]
-    filled = False
-    for selector in search_selectors:
-        try:
-            field = page.locator(selector).first
-            if field.is_visible(timeout=2000):
-                field.fill(client)
-                log(f"Entered client name using selector: {selector}")
-                filled = True
-                break
-        except Exception:
-            continue
-    if not filled:
-        log("Could not find the search box automatically - "
-            "fill it in the browser (run with HEADLESS=false) if needed.")
-
-    # --- Step 3: click the blue 'Locate' search button ---
-    for selector in (
-        "button:has-text('Locate')",
-        "input[value='Locate']",
-        "a:has-text('Locate')",
-    ):
-        try:
-            el = page.locator(selector).last
-            if el.is_visible(timeout=2000):
-                el.click()
-                log("Clicked the 'Locate' search button.")
-                break
-        except Exception:
-            continue
-    page.wait_for_timeout(3000)
-
-    # --- Step 4: open the matching result row ---
-    for selector in (
-        f"text={client}",
-        "table tbody tr",
-        "[role='row']",
-    ):
-        try:
-            row = page.locator(selector).first
-            if row.is_visible(timeout=3000):
-                row.dblclick()
-                log(f"Opened the account result ({selector}).")
-                break
-        except Exception:
-            continue
+    # Open the 'Access' menu and go to 'Attachments'.
+    page.get_by_title("Access (None)").locator("i").click()
+    page.wait_for_timeout(1000)
+    page.get_by_text("Attachments").first.click()
+    log("Opened the policy's Attachments.")
     page.wait_for_timeout(3000)
 
 
-def open_documents_section(page):
+def download_attachments(page):
     """
-    Open the 'Policies' section from the left sidebar. This opens the next
-    page where the policy documents live (further steps to be added).
+    Download attachment(s) from the policy's Attachments list.
+
+    If ATTACHMENT_NAME is set, download just that one; otherwise download
+    every attachment row found. Each download uses: open the attachment,
+    then click the 'Download' button.
     """
-    SECTION = "Policies"
-    for selector in (f"text={SECTION}", f"a:has-text('{SECTION}')"):
+    downloaded = []
+    target_name = config.ATTACHMENT_NAME.strip()
+
+    def download_one(name):
+        """Open an attachment by name and click Download; save the file."""
         try:
-            el = page.locator(selector).first
-            if el.is_visible(timeout=3000):
-                el.click()
-                log(f"Opened the '{SECTION}' section.")
-                break
+            page.get_by_text(name).first.dblclick()
+            page.wait_for_timeout(1500)
+            with page.expect_download(timeout=30000) as dl_info:
+                page.get_by_role("button", name="Download").click()
+            saved = save_download(dl_info.value, len(downloaded) + 1)
+            downloaded.append(saved)
+            return True
+        except Exception as exc:
+            log(f"Could not download {name!r}: {exc}")
+            return False
+
+    if target_name:
+        log(f"Downloading specific attachment: {target_name!r}")
+        download_one(target_name)
+    else:
+        # Download every attachment row. We collect visible row names first.
+        log("No specific attachment set - downloading all listed attachments.")
+        try:
+            rows = page.get_by_role("row")
+            count = rows.count()
         except Exception:
-            continue
-    page.wait_for_timeout(3000)
+            count = 0
+
+        names = []
+        for i in range(count):
+            try:
+                text = rows.nth(i).inner_text(timeout=1000).strip()
+                # Keep rows that look like a document name (skip headers/blank).
+                first_line = text.splitlines()[0].strip() if text else ""
+                if first_line and first_line not in names:
+                    names.append(first_line)
+            except Exception:
+                continue
+
+        if not names:
+            log("No attachment rows detected. Run with HEADLESS=false to "
+                "inspect, or set ATTACHMENT_NAME in .env to target one file.")
+        for name in names:
+            download_one(name)
+
+    return downloaded
 
 
 def navigate_and_download(page):
-    """
-    Navigate Epic and download the client's documents.
-
-    Flow: Locate the client -> open the documents section -> download files.
-    The download step uses a generic 'click anything that downloads' approach
-    until we tailor it from your recorded clicks (playwright codegen).
-    """
+    """Full flow: locate client -> open policy attachments -> download."""
     locate_client(page)
-    open_documents_section(page)
-
-    # We have opened the 'Policies' page. The next steps (which policy to open
-    # and how to download) are not defined yet, so pause here and keep the
-    # browser open so you can observe the Policies page and describe the next
-    # step. Set STOP_AFTER_POLICIES = False once the download steps are added.
-    STOP_AFTER_POLICIES = True
-    if STOP_AFTER_POLICIES:
-        log("Reached the 'Policies' page. Pausing here so you can inspect it.")
-        log("Describe the next step, and press ENTER to close the browser.")
-        try:
-            input("Press ENTER to finish... ")
-        except (KeyboardInterrupt, EOFError):
-            pass
-        return []
-
-    downloaded = []
-
-    # --- Generic fallback: click elements that look like document downloads ---
-    candidate_selectors = [
-        "a[href$='.pdf']",
-        "a[download]",
-        "a:has-text('Download')",
-        "button:has-text('Download')",
-        "[title*='download' i]",
-    ]
-
-    seen = set()
-    for selector in candidate_selectors:
-        try:
-            locator = page.locator(selector)
-            count = locator.count()
-        except Exception:
-            continue
-
-        for i in range(count):
-            element = locator.nth(i)
-            try:
-                label = (element.inner_text(timeout=1000) or "").strip()[:60]
-            except Exception:
-                label = selector
-
-            key = f"{selector}#{i}:{label}"
-            if key in seen:
-                continue
-            seen.add(key)
-
-            try:
-                with page.expect_download(timeout=15000) as dl_info:
-                    element.click()
-                download = dl_info.value
-                downloaded.append(save_download(download, len(downloaded) + 1))
-            except PWTimeout:
-                # Click did not produce a download; skip quietly.
-                continue
-            except Exception as exc:
-                log(f"Skipped a candidate ({label!r}): {exc}")
-                continue
+    open_policy_attachments(page)
+    downloaded = download_attachments(page)
 
     if not downloaded:
-        log("No downloads were captured on the current page.")
-        log("Edit navigate_and_download() to reach your documents, or run")
-        log("with HEADLESS=false to inspect the page and adjust selectors.")
+        log("No documents were downloaded.")
+        log("Run with HEADLESS=false to watch the flow and adjust selectors,")
+        log("or set ATTACHMENT_NAME in .env to target a specific document.")
 
     return downloaded
 
@@ -276,7 +229,7 @@ def main():
         )
         page = context.new_page()
 
-        log(f"Opening Applied Epic with saved session...")
+        log("Opening Applied Epic with saved session...")
         page.goto(config.EPIC_URL, wait_until="domcontentloaded")
         page.wait_for_timeout(4000)  # let the SPA settle
 
