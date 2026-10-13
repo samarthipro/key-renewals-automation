@@ -252,8 +252,12 @@ def main():
         install_session_storage(context)
 
         page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_navigation_timeout(120000)
+        page.set_default_timeout(30000)
         log("Opening Applied Epic with the complete saved browser state...")
-        page.goto(config.EPIC_URL, wait_until="domcontentloaded")
+        # Applied Epic is a slow SPA. Wait only for the initial response here;
+        # session_is_valid() below waits for the actual authenticated UI.
+        page.goto(config.EPIC_URL, wait_until="commit", timeout=120000)
 
         if not session_is_valid(page):
             context.close()

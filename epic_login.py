@@ -158,9 +158,14 @@ def main():
         )
 
         page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_navigation_timeout(120000)
+        page.set_default_timeout(30000)
         log(f"Opening {config.EPIC_URL}")
-        page.goto(config.EPIC_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
+        # Applied Epic is a slow SPA and may not fire DOMContentLoaded within
+        # Playwright's 30-second default. "commit" confirms the server response;
+        # the logged-in toolbar polling below handles the remaining UI load.
+        page.goto(config.EPIC_URL, wait_until="commit", timeout=120000)
+        page.wait_for_timeout(5000)
 
         # If the persistent profile is already authenticated, do not trigger a
         # new login. Otherwise click Login and let the user finish Okta/MFA.
