@@ -261,8 +261,45 @@ def click_visible_locate_text(page):
     raise RuntimeError("No visible Locate text control was found.")
 
 
+def click_active_program_locate(page):
+    """Click Locate inside Epic's currently visible program tree."""
+    active_program = page.locator("root app program:visible").last
+    control = active_program.locator('[title="Locate (F2)"]').first
+    icon = control.locator("i").first
+    if icon.is_visible(timeout=3000):
+        icon.click(timeout=10000)
+    else:
+        control.click(timeout=10000)
+
+
+def javascript_click_active_locate(page):
+    """Invoke the visible Locate control's DOM click handler directly."""
+    control = (
+        page.locator("root app program:visible")
+        .last.locator('[title="Locate (F2)"]')
+        .first
+    )
+    control.evaluate("element => element.click()")
+
+
+def coordinate_click_active_locate(page):
+    """Send a real mouse click at the visible Locate control's center."""
+    control = (
+        page.locator("root app program:visible")
+        .last.locator('[title="Locate (F2)"]')
+        .first
+    )
+    box = control.bounding_box()
+    if box is None:
+        raise RuntimeError("Visible Locate control has no bounding box.")
+    page.mouse.click(
+        box["x"] + box["width"] / 2,
+        box["y"] + box["height"] / 2,
+    )
+
+
 def open_locate(page):
-    """Open Locate and verify its textbox, trying exact XPath first."""
+    """Open Locate and verify its textbox, targeting the active program."""
     title_control = page.get_by_title("Locate (F2)")
     locate_xpath_program_2 = (
         "/html/body/root/app/program[2]/div/toolbar/div/div[2]/div/"
@@ -273,6 +310,9 @@ def open_locate(page):
         "div[2]/div[1]"
     )
     attempts = [
+        ("visible Epic program Locate control", lambda: click_active_program_locate(page)),
+        ("visible Locate DOM handler", lambda: javascript_click_active_locate(page)),
+        ("visible Locate screen coordinates", lambda: coordinate_click_active_locate(page)),
         (
             "provided Locate XPath (program 2)",
             lambda: page.locator(f"xpath={locate_xpath_program_2}").click(
@@ -308,10 +348,31 @@ def open_locate(page):
         except Exception as error:
             log(f"Locate attempt failed ({description}): {error}")
 
+    # Do not terminate the authenticated worker during selector tuning. Report
+    # useful DOM counts and allow one manual Locate click while polling for the
+    # same search textbox; all later steps remain automated.
+    try:
+        visible_programs = page.locator("root app program:visible").count()
+        titled_controls = page.locator('[title="Locate (F2)"]').count()
+        log(
+            f"Locate diagnostics: url={page.url!r}, "
+            f"visible_programs={visible_programs}, "
+            f"title_controls={titled_controls}."
+        )
+    except Exception:
+        pass
+
+    log("Automatic Locate clicks did not open the screen.")
+    log("Click Locate once in the open browser; waiting up to 60 seconds...")
+    search_box = wait_for_locate_textbox(page, timeout_seconds=60)
+    if search_box is not None:
+        log("Detected the Locate screen after the manual click; continuing.")
+        return search_box
+
     raise RuntimeError(
-        "Could not open Epic Locate using the supplied XPath, toolbar controls, "
-        "F2 shortcut, or visible Locate label. The Locate screen never exposed "
-        "its Account/Business-name textbox."
+        "Locate did not open automatically or during the 60-second manual "
+        "fallback. The authenticated worker will remain available for another "
+        "job."
     )
 
 
