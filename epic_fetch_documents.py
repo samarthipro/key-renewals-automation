@@ -36,29 +36,66 @@ def log(message):
     print(f"[{datetime.now():%H:%M:%S}] {message}", flush=True)
 
 
-def install_session_storage(context):
-    """Restore saved sessionStorage before Applied Epic loads."""
+def install_saved_browser_state(context):
+    """Restore cookies, localStorage, and sessionStorage before Epic loads."""
+    if not config.STORAGE_STATE.exists():
+        raise FileNotFoundError(
+            f"Missing {config.STORAGE_STATE}. Run 'python epic_login.py' again."
+        )
     if not config.SESSION_STORAGE.exists():
         raise FileNotFoundError(
-            f"Missing {config.SESSION_STORAGE}. Run 'python epic_login.py' "
-            "again to capture the complete authenticated state."
+            f"Missing {config.SESSION_STORAGE}. Run 'python epic_login.py' again."
         )
 
-    state = json.loads(config.SESSION_STORAGE.read_text(encoding="utf-8"))
-    encoded_state = json.dumps(state).replace("</", "<\\/")
+    storage_state = json.loads(config.STORAGE_STATE.read_text(encoding="utf-8"))
+    session_state = json.loads(
+        config.SESSION_STORAGE.read_text(encoding="utf-8")
+    )
+
+    # Persistent Chromium profiles do not reliably retain session-only cookies
+    # after the browser process exits. Import Playwright's saved cookies into
+    # the newly opened persistent context explicitly.
+    cookies = storage_state.get("cookies", [])
+    if cookies:
+        context.add_cookies(cookies)
+
+    local_state = {}
+    for origin_data in storage_state.get("origins", []):
+        origin = origin_data.get("origin")
+        if not origin:
+            continue
+        local_state[origin] = {
+            item["name"]: item["value"]
+            for item in origin_data.get("localStorage", [])
+        }
+
+    encoded_local = json.dumps(local_state).replace("</", "<\\/")
+    encoded_session = json.dumps(session_state).replace("</", "<\\/")
     context.add_init_script(
         script=f"""
         (() => {{
-            const allState = {encoded_state};
-            const values = allState[window.location.origin];
-            if (!values) return;
-            for (const [key, value] of Object.entries(values)) {{
+            const allLocalState = {encoded_local};
+            const allSessionState = {encoded_session};
+            const origin = window.location.origin;
+
+            const localValues = allLocalState[origin] || {{}};
+            for (const [key, value] of Object.entries(localValues)) {{
+                window.localStorage.setItem(key, value);
+            }}
+
+            const sessionValues = allSessionState[origin] || {{}};
+            for (const [key, value] of Object.entries(sessionValues)) {{
                 window.sessionStorage.setItem(key, value);
             }}
         }})();
         """
     )
-    log(f"Prepared sessionStorage for {len(state)} origin(s).")
+    log(
+        "Restored saved browser state: "
+        f"{len(cookies)} cookie(s), "
+        f"localStorage for {len(local_state)} origin(s), "
+        f"sessionStorage for {len(session_state)} origin(s)."
+    )
 
 
 def session_is_valid(page):
@@ -234,7 +271,11 @@ def navigate_and_download(page):
 
 
 def main():
-    if not config.PROFILE_DIR.exists() or not config.SESSION_STORAGE.exists():
+    if (
+        not config.PROFILE_DIR.exists()
+        or not config.STORAGE_STATE.exists()
+        or not config.SESSION_STORAGE.exists()
+    ):
         raise FileNotFoundError(
             "Complete authenticated browser state was not found. "
             "Run 'python epic_login.py' with the updated scripts first."
@@ -249,7 +290,7 @@ def main():
             headless=config.HEADLESS,
             accept_downloads=True,
         )
-        install_session_storage(context)
+        install_saved_browser_state(context)
 
         page = context.pages[0] if context.pages else context.new_page()
         page.set_default_navigation_timeout(120000)
