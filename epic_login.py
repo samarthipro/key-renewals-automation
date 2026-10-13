@@ -42,6 +42,33 @@ def log(message):
     print(f"[{datetime.now():%H:%M:%S}] {message}", flush=True)
 
 
+def try_click_login_button(page):
+    """
+    The first Applied Epic page is a splash screen with a single 'Login'
+    button (no credential fields yet). Click it to reach the sign-in page.
+
+    Best effort: if the button is not found, you can click it yourself in the
+    browser window.
+    """
+    login_button_selectors = [
+        "button:has-text('Login')",
+        "a:has-text('Login')",
+        "input[value='Login']",
+        "text=Login",
+    ]
+    for selector in login_button_selectors:
+        try:
+            button = page.locator(selector).first
+            if button.is_visible(timeout=2000):
+                button.click()
+                log(f"Clicked the Login button using selector: {selector}")
+                return True
+        except Exception:
+            continue
+    log("Could not auto-click 'Login' - please click it yourself in the browser.")
+    return False
+
+
 def try_fill_login(page):
     """
     Best-effort attempt to pre-fill the username/password fields.
@@ -97,8 +124,20 @@ def main():
         log(f"Opening {config.EPIC_URL}")
         page.goto(config.EPIC_URL, wait_until="domcontentloaded")
 
-        # Give the SPA a moment to render the login form, then try to fill it.
+        # The first page is a splash screen with a 'Login' button.
         page.wait_for_timeout(3000)
+        try_click_login_button(page)
+
+        # After clicking Login, the sign-in page (and its credential fields)
+        # may load, sometimes in a new tab/window. Give it time, then try to
+        # fill the username/password on whichever page is now active.
+        page.wait_for_timeout(4000)
+
+        # If clicking Login opened a new tab, switch to the newest page.
+        if len(context.pages) > 1:
+            page = context.pages[-1]
+            log("Switched to the new sign-in tab.")
+
         try_fill_login(page)
 
         print("\n" + "=" * 70)
