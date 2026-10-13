@@ -79,30 +79,122 @@ def save_download(download, index):
     return target
 
 
+def locate_client(page):
+    """
+    Use Epic's 'Locate' screen to search for the client and open the account.
+
+    Mirrors the manual flow:
+      1. Click 'Locate' in the top toolbar.
+      2. In the Locate Criteria panel, type the client name into
+         'Account/Business name contains'.
+      3. Click the blue 'Locate' button.
+      4. Click the matching result row to open the account.
+
+    Applied Epic's markup varies, so each step tries several selectors and
+    falls back gracefully. Run with HEADLESS=false to watch it work, and
+    refine selectors using the codegen recorder if a step misses.
+    """
+    client = config.CLIENT_NAME
+    log(f"Locating client: {client!r}")
+
+    # --- Step 1: open the Locate screen ---
+    for selector in ("text=Locate", "a:has-text('Locate')", "button:has-text('Locate')"):
+        try:
+            el = page.locator(selector).first
+            if el.is_visible(timeout=3000):
+                el.click()
+                log(f"Clicked 'Locate' ({selector}).")
+                break
+        except Exception:
+            continue
+    page.wait_for_timeout(2000)
+
+    # --- Step 2: type the client name into the 'contains' field ---
+    search_selectors = [
+        "input[name*='contains' i]",
+        "input[id*='contains' i]",
+        "input[placeholder*='name' i]",
+        "input[type='text']",
+    ]
+    filled = False
+    for selector in search_selectors:
+        try:
+            field = page.locator(selector).first
+            if field.is_visible(timeout=2000):
+                field.fill(client)
+                log(f"Entered client name using selector: {selector}")
+                filled = True
+                break
+        except Exception:
+            continue
+    if not filled:
+        log("Could not find the search box automatically - "
+            "fill it in the browser (run with HEADLESS=false) if needed.")
+
+    # --- Step 3: click the blue 'Locate' search button ---
+    for selector in (
+        "button:has-text('Locate')",
+        "input[value='Locate']",
+        "a:has-text('Locate')",
+    ):
+        try:
+            el = page.locator(selector).last
+            if el.is_visible(timeout=2000):
+                el.click()
+                log("Clicked the 'Locate' search button.")
+                break
+        except Exception:
+            continue
+    page.wait_for_timeout(3000)
+
+    # --- Step 4: open the matching result row ---
+    for selector in (
+        f"text={client}",
+        "table tbody tr",
+        "[role='row']",
+    ):
+        try:
+            row = page.locator(selector).first
+            if row.is_visible(timeout=3000):
+                row.dblclick()
+                log(f"Opened the account result ({selector}).")
+                break
+        except Exception:
+            continue
+    page.wait_for_timeout(3000)
+
+
+def open_documents_section(page):
+    """
+    Open the sidebar section that holds the documents (e.g. 'Attachments').
+
+    TODO: confirm which section you want - the sidebar in your screenshot has
+    Attachments, Proofs of Insurance, Policies, etc. Set SECTION below.
+    """
+    SECTION = "Attachments"  # change to the section you need
+    for selector in (f"text={SECTION}", f"a:has-text('{SECTION}')"):
+        try:
+            el = page.locator(selector).first
+            if el.is_visible(timeout=3000):
+                el.click()
+                log(f"Opened the '{SECTION}' section.")
+                break
+        except Exception:
+            continue
+    page.wait_for_timeout(3000)
+
+
 def navigate_and_download(page):
     """
-    Navigate Epic and download your documents.
+    Navigate Epic and download the client's documents.
 
-    ==========================================================================
-    TODO (customise for your workflow): replace the generic logic below with
-    the exact steps to reach your documents. Common patterns:
-
-        # Search for a client/account:
-        page.fill("input[placeholder*='Search']", "Lotus HR Inc")
-        page.keyboard.press("Enter")
-        page.wait_for_load_state("networkidle")
-        page.click("text=Lotus HR Inc")
-
-        # Open the Attachments / Documents area:
-        page.click("text=Attachments")
-
-        # Then let the download handler below capture each file as you click.
-    ==========================================================================
-
-    The code below is a safe GENERIC fallback: it finds links/buttons that
-    look like downloads on the current page and clicks each one, saving any
-    file Epic serves. Clicks that do not trigger a download are ignored.
+    Flow: Locate the client -> open the documents section -> download files.
+    The download step uses a generic 'click anything that downloads' approach
+    until we tailor it from your recorded clicks (playwright codegen).
     """
+    locate_client(page)
+    open_documents_section(page)
+
     downloaded = []
 
     # --- Generic fallback: click elements that look like document downloads ---

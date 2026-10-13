@@ -45,6 +45,9 @@ if not STORAGE_STATE.is_absolute():
 # Where downloaded documents are saved.
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", BASE_DIR / "downloads"))
 
+# The client/account to search for in Epic's "Locate" screen.
+CLIENT_NAME = os.getenv("CLIENT_NAME", "LOTUS HR")
+
 # Behaviour toggles.
 LOGIN_TIMEOUT_SECONDS = int(os.getenv("LOGIN_TIMEOUT_SECONDS", "300"))
 HEADLESS = os.getenv("HEADLESS", "false").strip().lower() in ("1", "true", "yes")
