@@ -1,12 +1,19 @@
 """
 Fetch policy documents from Applied Epic using the authenticated browser state.
 
-Authentication is restored from the persistent Chromium profile created by
-`epic_login.py`, with an explicit sessionStorage restoration because Applied
-Epic/Okta does not keep all login state in ordinary Playwright storage state.
+Authentication behavior:
+- The script first attempts to restore the saved browser state.
+- Some Applied Epic/Okta tenants reject reconstructed state after Chromium
+  exits. If that happens, this script opens the authorized login flow and
+  waits for you to complete Okta, then continues extraction immediately in
+  the SAME browser process. Do not run epic_login.py separately first.
 
-Navigation flow:
+Navigation flow for every requested client:
     Locate -> client -> Policies -> policy -> Access -> Attachments -> Download
+
+After authentication, the script stays running and prompts for a client name
+and policy number. It keeps the same live browser/session for every job and
+closes only when you enter EXIT or manually close the browser.
 
 Run:
     python epic_fetch_documents.py
@@ -19,6 +26,13 @@ import sys
 import time
 
 import epic_config as config
+from epic_login import (
+    find_logged_in_page,
+    save_session_storage,
+    save_storage_state,
+    try_click_login_button,
+    try_fill_login,
+)
 
 try:
     from playwright.sync_api import sync_playwright
@@ -124,6 +138,60 @@ def session_is_valid(page):
     return False
 
 
+def authenticate_in_current_context(context, page):
+    """
+    Complete Epic/Okta login and return the authenticated Epic page.
+
+    This deliberately keeps the same Chromium process alive. Some Applied Epic
+    tenants reject a reconstructed session after the browser exits, even when
+    cookies and web storage are restored.
+    """
+    log("Saved authentication was rejected by Applied Epic.")
+    log("Starting login in this same browser; extraction will continue afterward.")
+
+    try_click_login_button(page)
+    page.wait_for_timeout(4000)
+
+    sign_in_page = context.pages[-1]
+    if sign_in_page is not page:
+        log("Switched to the Okta sign-in popup.")
+    try_fill_login(sign_in_page)
+
+    print("\n" + "=" * 70)
+    print(" COMPLETE LOGIN IN THE OPEN BROWSER:")
+    print("   1. Enter/confirm your username and password.")
+    print("   2. Complete the authorized Okta push/code verification.")
+    print("   3. Wait for the Epic home screen with the Locate toolbar.")
+    print("\n Do not close the browser or press ENTER here.")
+    print(" Extraction starts automatically after successful login.")
+    print("=" * 70 + "\n")
+
+    deadline = time.time() + config.LOGIN_TIMEOUT_SECONDS
+    authenticated_page = None
+    while time.time() < deadline:
+        authenticated_page = find_logged_in_page(context)
+        if authenticated_page is not None:
+            break
+        log("Waiting for the Epic home screen...")
+        time.sleep(3)
+
+    if authenticated_page is None:
+        raise RuntimeError(
+            "Timed out waiting for the authenticated Epic home screen. "
+            "Re-run the script and complete Okta before the configured timeout."
+        )
+
+    authenticated_page.bring_to_front()
+    authenticated_page.wait_for_timeout(3000)
+    log("Confirmed authenticated home screen in the live browser session.")
+
+    # Keep backups for diagnostics/future reuse attempts. The extraction below
+    # does not close or replace this authenticated browser process.
+    save_session_storage(context)
+    save_storage_state(context)
+    return authenticated_page
+
+
 def save_download(download, index):
     """Save a download into DOWNLOAD_DIR without overwriting an older file."""
     suggested = download.suggested_filename or f"document_{index}"
@@ -137,22 +205,161 @@ def save_download(download, index):
     return target
 
 
-def locate_client(page):
-    """Locate the configured client and open its matching account row."""
-    client = config.CLIENT_NAME
+def find_visible_textbox(page):
+    """Return Epic Locate's visible Account/Business-name textbox."""
+    exact_xpaths = [
+        # Selectors captured from Applied Epic; program index varies by screen.
+        "/html/body/root/app/program[2]/div/div[2]/div[2]/div/div/screen/div/div/div/proxy[1]/div/asi-frame/div/div[2]/proxy[5]/div/asi-string-edit/div/input",
+        "/html/body/root/app/program[1]/div/div[2]/div[2]/div/div/screen/div/div/div/proxy[1]/div/asi-frame/div/div[2]/proxy[5]/div/asi-string-edit/div/input",
+    ]
+    for xpath in exact_xpaths:
+        try:
+            box = page.locator(f"xpath={xpath}")
+            if box.is_visible(timeout=500):
+                return box
+        except Exception:
+            continue
+
+    # Semantic fallback if Applied changes the program/proxy indexes.
+    boxes = page.get_by_role("textbox")
+    try:
+        count = boxes.count()
+    except Exception:
+        return None
+    for index in range(count):
+        try:
+            box = boxes.nth(index)
+            if box.is_visible(timeout=300):
+                return box
+        except Exception:
+            continue
+    return None
+
+
+def wait_for_locate_textbox(page, timeout_seconds=7):
+    """Wait for Locate's Account/Business search textbox."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        box = find_visible_textbox(page)
+        if box is not None:
+            return box
+        page.wait_for_timeout(500)
+    return None
+
+
+def click_visible_locate_text(page):
+    """Click a visible exact 'Locate' toolbar label."""
+    candidates = page.get_by_text("Locate", exact=True)
+    for index in range(candidates.count()):
+        candidate = candidates.nth(index)
+        try:
+            if candidate.is_visible(timeout=300):
+                candidate.click(timeout=5000)
+                return
+        except Exception:
+            continue
+    raise RuntimeError("No visible Locate text control was found.")
+
+
+def open_locate(page):
+    """Open Locate and verify its textbox, trying exact XPath first."""
+    title_control = page.get_by_title("Locate (F2)")
+    locate_xpath_program_2 = (
+        "/html/body/root/app/program[2]/div/toolbar/div/div[2]/div/"
+        "div[2]/div[1]"
+    )
+    locate_xpath_program_1 = (
+        "/html/body/root/app/program[1]/div/toolbar/div/div[2]/div/"
+        "div[2]/div[1]"
+    )
+    attempts = [
+        (
+            "provided Locate XPath (program 2)",
+            lambda: page.locator(f"xpath={locate_xpath_program_2}").click(
+                timeout=10000, force=True
+            ),
+        ),
+        (
+            "provided Locate XPath (program 1)",
+            lambda: page.locator(f"xpath={locate_xpath_program_1}").click(
+                timeout=10000, force=True
+            ),
+        ),
+        (
+            "Locate toolbar icon",
+            lambda: title_control.locator("i").click(timeout=10000, force=True),
+        ),
+        (
+            "Locate toolbar container",
+            lambda: title_control.click(timeout=10000, force=True),
+        ),
+        ("F2 keyboard shortcut", lambda: page.keyboard.press("F2")),
+        ("visible Locate label", lambda: click_visible_locate_text(page)),
+    ]
+
+    for description, action in attempts:
+        try:
+            log(f"Trying to open Locate using: {description}...")
+            action()
+            search_box = wait_for_locate_textbox(page)
+            if search_box is not None:
+                log(f"Locate opened using: {description}.")
+                return search_box
+        except Exception as error:
+            log(f"Locate attempt failed ({description}): {error}")
+
+    raise RuntimeError(
+        "Could not open Epic Locate using the supplied XPath, toolbar controls, "
+        "F2 shortcut, or visible Locate label. The Locate screen never exposed "
+        "its Account/Business-name textbox."
+    )
+
+
+def submit_locate_search(page, search_box):
+    """Click the supplied blue Locate button, falling back to Enter."""
+    button_xpaths = [
+        "/html/body/root/app/program[2]/div/div[2]/div[2]/div[1]/div/screen/div/div/div/proxy[1]/div/asi-frame/div/div[2]/proxy[12]/div/asi-button/button",
+        "/html/body/root/app/program[1]/div/div[2]/div[2]/div[1]/div/screen/div/div/div/proxy[1]/div/asi-frame/div/div[2]/proxy[12]/div/asi-button/button",
+    ]
+    for xpath in button_xpaths:
+        try:
+            button = page.locator(f"xpath={xpath}")
+            if button.is_visible(timeout=1000):
+                button.click(timeout=10000)
+                log("Clicked the blue Locate search button using its XPath.")
+                return
+        except Exception:
+            continue
+
+    # Semantic button fallback, then keyboard fallback.
+    buttons = page.get_by_role("button", name="Locate")
+    for index in range(buttons.count()):
+        try:
+            button = buttons.nth(index)
+            if button.is_visible(timeout=300):
+                button.click(timeout=10000)
+                log("Clicked the blue Locate search button by role.")
+                return
+        except Exception:
+            continue
+
+    search_box.press("Enter")
+    log("Locate button was not found; submitted search with Enter.")
+
+
+def locate_client(page, client, lookup_code=""):
+    """Locate a client and open its account result."""
     log(f"Locating client: {client!r}")
 
-    page.get_by_title("Locate (F2)").locator("i").click(timeout=15000)
-    page.wait_for_timeout(1500)
-
-    search_box = page.get_by_role("textbox").first
+    # Do not assume a click succeeded. open_locate() verifies that the Locate
+    # textbox actually appeared before this function continues.
+    search_box = open_locate(page)
     search_box.click()
     search_box.fill(client)
-    search_box.press("Enter")
+    submit_locate_search(page, search_box)
     log("Submitted the client search.")
     page.wait_for_timeout(3000)
 
-    lookup_code = config.LOOKUP_CODE
     opened = False
     if lookup_code:
         try:
@@ -166,19 +373,53 @@ def locate_client(page):
             log(f"Could not open by lookup code ({error}); trying client name.")
 
     if not opened:
-        page.get_by_text(client).first.click(timeout=15000)
-        log(f"Opened account by name: {client}")
+        # For clients without a configured lookup code, open the last visible
+        # text match; Epic's result row follows the Locate criteria controls.
+        matches = page.get_by_text(
+            re.compile(re.escape(client), re.IGNORECASE), exact=False
+        )
+        clicked = False
+        for index in range(matches.count() - 1, -1, -1):
+            candidate = matches.nth(index)
+            try:
+                if candidate.is_visible(timeout=300):
+                    candidate.click(timeout=15000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            raise RuntimeError(f"No visible account result matched {client!r}.")
+        log(f"Opened the first matching account result for: {client}")
 
     page.wait_for_timeout(3000)
 
 
-def open_policy_attachments(page):
-    """Open Policies, choose the configured policy, then open Attachments."""
+def click_policies(page):
+    """Click Policies using the supplied sidebar XPath with fallbacks."""
+    policy_xpaths = [
+        "/html/body/root/app/program[2]/div/div[2]/div[1]/sidebar/div/div/sidebar-button[6]/div/a",
+        "/html/body/root/app/program[1]/div/div[2]/div[1]/sidebar/div/div/sidebar-button[6]/div/a",
+    ]
+    for xpath in policy_xpaths:
+        try:
+            control = page.locator(f"xpath={xpath}")
+            if control.is_visible(timeout=1000):
+                control.click(timeout=10000)
+                log("Clicked Policies using the supplied sidebar XPath.")
+                return
+        except Exception:
+            continue
+
     page.locator("a").filter(has_text="Policies").click(timeout=15000)
-    log("Opened the Policies section.")
+    log("Clicked Policies using its visible label.")
+
+
+def open_policy_attachments(page, policy_code):
+    """Open Policies, choose the requested policy, then open Attachments."""
+    click_policies(page)
     page.wait_for_timeout(3000)
 
-    policy_code = config.POLICY_CODE
     page.get_by_text(policy_code).click(timeout=15000)
     log(f"Opened policy: {policy_code}")
     page.wait_for_timeout(2000)
@@ -190,10 +431,10 @@ def open_policy_attachments(page):
     page.wait_for_timeout(3000)
 
 
-def download_attachments(page):
-    """Download one configured attachment, or attempt every listed row."""
+def download_attachments(page, target_name=""):
+    """Download one requested attachment, or attempt every listed row."""
     downloaded = []
-    target_name = config.ATTACHMENT_NAME.strip()
+    target_name = target_name.strip()
 
     def download_one(name):
         try:
@@ -261,56 +502,137 @@ def save_current_session_storage(context):
     config.SESSION_STORAGE.write_text(json.dumps(saved, indent=2), encoding="utf-8")
 
 
-def navigate_and_download(page):
-    locate_client(page)
-    open_policy_attachments(page)
-    downloaded = download_attachments(page)
+def navigate_and_download(
+    page,
+    client,
+    policy_code,
+    lookup_code="",
+    attachment_name="",
+):
+    """Run one client/policy download job in the current live session."""
+    locate_client(page, client, lookup_code)
+    open_policy_attachments(page, policy_code)
+    downloaded = download_attachments(page, attachment_name)
     if not downloaded:
         log("No documents were downloaded.")
     return downloaded
 
 
-def main():
-    if (
-        not config.PROFILE_DIR.exists()
-        or not config.STORAGE_STATE.exists()
-        or not config.SESSION_STORAGE.exists()
-    ):
-        raise FileNotFoundError(
-            "Complete authenticated browser state was not found. "
-            "Run 'python epic_login.py' with the updated scripts first."
-        )
+def run_client_worker(context, page):
+    """Keep the authenticated browser alive and process jobs until EXIT."""
+    total_jobs = 0
+    total_downloads = 0
 
+    print("\n" + "=" * 70)
+    print(" APPLIED EPIC DOCUMENT WORKER IS ACTIVE")
+    print(" The same authenticated browser will stay open for every client.")
+    print(" Type EXIT as the client name when you want to close it.")
+    print("=" * 70)
+
+    while True:
+        if page.is_closed():
+            log("The browser was closed. Stopping the worker.")
+            break
+
+        try:
+            client = input(
+                f"\nClient name [{config.CLIENT_NAME}] or EXIT: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            client = "EXIT"
+
+        if client.casefold() in {"exit", "quit", "q"}:
+            break
+        if not client:
+            client = config.CLIENT_NAME
+
+        default_policy = (
+            config.POLICY_CODE
+            if client.casefold() == config.CLIENT_NAME.casefold()
+            else ""
+        )
+        policy_prompt = f"Policy number [{default_policy}]: " if default_policy else "Policy number: "
+        try:
+            policy_code = input(policy_prompt).strip() or default_policy
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if not policy_code:
+            log("A policy number is required. No job was started.")
+            continue
+
+        # The configured lookup/attachment values belong to the configured
+        # default client. Other clients are selected by their result name and
+        # all their attachment rows are attempted.
+        is_default_client = client.casefold() == config.CLIENT_NAME.casefold()
+        lookup_code = config.LOOKUP_CODE if is_default_client else ""
+        attachment_name = config.ATTACHMENT_NAME if is_default_client else ""
+
+        try:
+            # Close any leftover viewer/menu from the previous job.
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
+
+            if not session_is_valid(page):
+                page = authenticate_in_current_context(context, page)
+
+            log(f"Starting job for client={client!r}, policy={policy_code!r}")
+            downloaded = navigate_and_download(
+                page,
+                client,
+                policy_code,
+                lookup_code=lookup_code,
+                attachment_name=attachment_name,
+            )
+            total_jobs += 1
+            total_downloads += len(downloaded)
+            log(
+                f"Job finished: {len(downloaded)} document(s). "
+                "The browser remains active for another client."
+            )
+            save_current_session_storage(context)
+        except Exception as error:
+            log(f"JOB ERROR for {client!r} / {policy_code!r}: {error}")
+            log("The browser remains open. You may enter another client or EXIT.")
+
+    log(
+        f"Worker finished: {total_jobs} successful job(s), "
+        f"{total_downloads} document(s) downloaded."
+    )
+
+
+def main():
+    config.PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     log(f"Documents will be saved to: {config.DOWNLOAD_DIR}")
 
     with sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=str(config.PROFILE_DIR),
-            headless=config.HEADLESS,
+            headless=False,  # visible because interactive Okta may be required
             accept_downloads=True,
         )
-        install_saved_browser_state(context)
+
+        if config.STORAGE_STATE.exists() and config.SESSION_STORAGE.exists():
+            install_saved_browser_state(context)
+        else:
+            log("No complete saved state found; interactive login will be used.")
 
         page = context.pages[0] if context.pages else context.new_page()
         page.set_default_navigation_timeout(120000)
         page.set_default_timeout(30000)
-        log("Opening Applied Epic with the complete saved browser state...")
-        # Applied Epic is a slow SPA. Wait only for the initial response here;
-        # session_is_valid() below waits for the actual authenticated UI.
+        log("Opening Applied Epic...")
         page.goto(config.EPIC_URL, wait_until="commit", timeout=120000)
 
-        if not session_is_valid(page):
-            context.close()
-            raise RuntimeError(
-                "Applied Epic still shows the Login page. The Okta/Epic session "
-                "has expired or was not fully captured. Close all automation "
-                "browser windows, run 'python epic_login.py', and then run this "
-                "script again."
-            )
+        if session_is_valid(page):
+            log("Reused authenticated home screen from saved browser state.")
+        else:
+            # Applied Epic/Okta rejected the reconstructed state. Authenticate
+            # and continue extraction without ending this browser process.
+            page = authenticate_in_current_context(context, page)
 
-        log("Confirmed authenticated home screen. Navigating to documents...")
-        downloaded = navigate_and_download(page)
+        log("Authentication is ready. Starting the persistent client worker...")
+        run_client_worker(context, page)
         save_current_session_storage(context)
 
         try:
@@ -318,7 +640,7 @@ def main():
         except TypeError:
             context.storage_state(path=str(config.STORAGE_STATE))
 
-        log(f"Done. {len(downloaded)} document(s) downloaded.")
+        log("Closing the Applied Epic browser worker.")
         context.close()
 
 
