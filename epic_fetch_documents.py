@@ -8,8 +8,12 @@ Authentication behavior:
   waits for you to complete Okta, then continues extraction immediately in
   the SAME browser process. Do not run epic_login.py separately first.
 
-Navigation flow:
+Navigation flow for every requested client:
     Locate -> client -> Policies -> policy -> Access -> Attachments -> Download
+
+After authentication, the script stays running and prompts for a client name
+and policy number. It keeps the same live browser/session for every job and
+closes only when you enter EXIT or manually close the browser.
 
 Run:
     python epic_fetch_documents.py
@@ -277,9 +281,8 @@ def open_locate(page):
     )
 
 
-def locate_client(page):
-    """Locate the configured client and open its matching account row."""
-    client = config.CLIENT_NAME
+def locate_client(page, client, lookup_code=""):
+    """Locate a client and open its account result."""
     log(f"Locating client: {client!r}")
 
     # Do not assume a click succeeded. open_locate() verifies that the Locate
@@ -291,7 +294,6 @@ def locate_client(page):
     log("Submitted the client search.")
     page.wait_for_timeout(3000)
 
-    lookup_code = config.LOOKUP_CODE
     opened = False
     if lookup_code:
         try:
@@ -305,19 +307,34 @@ def locate_client(page):
             log(f"Could not open by lookup code ({error}); trying client name.")
 
     if not opened:
-        page.get_by_text(client).first.click(timeout=15000)
-        log(f"Opened account by name: {client}")
+        # For clients without a configured lookup code, open the last visible
+        # text match; Epic's result row follows the Locate criteria controls.
+        matches = page.get_by_text(
+            re.compile(re.escape(client), re.IGNORECASE), exact=False
+        )
+        clicked = False
+        for index in range(matches.count() - 1, -1, -1):
+            candidate = matches.nth(index)
+            try:
+                if candidate.is_visible(timeout=300):
+                    candidate.click(timeout=15000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            raise RuntimeError(f"No visible account result matched {client!r}.")
+        log(f"Opened the first matching account result for: {client}")
 
     page.wait_for_timeout(3000)
 
 
-def open_policy_attachments(page):
-    """Open Policies, choose the configured policy, then open Attachments."""
+def open_policy_attachments(page, policy_code):
+    """Open Policies, choose the requested policy, then open Attachments."""
     page.locator("a").filter(has_text="Policies").click(timeout=15000)
     log("Opened the Policies section.")
     page.wait_for_timeout(3000)
 
-    policy_code = config.POLICY_CODE
     page.get_by_text(policy_code).click(timeout=15000)
     log(f"Opened policy: {policy_code}")
     page.wait_for_timeout(2000)
@@ -329,10 +346,10 @@ def open_policy_attachments(page):
     page.wait_for_timeout(3000)
 
 
-def download_attachments(page):
-    """Download one configured attachment, or attempt every listed row."""
+def download_attachments(page, target_name=""):
+    """Download one requested attachment, or attempt every listed row."""
     downloaded = []
-    target_name = config.ATTACHMENT_NAME.strip()
+    target_name = target_name.strip()
 
     def download_one(name):
         try:
@@ -400,13 +417,103 @@ def save_current_session_storage(context):
     config.SESSION_STORAGE.write_text(json.dumps(saved, indent=2), encoding="utf-8")
 
 
-def navigate_and_download(page):
-    locate_client(page)
-    open_policy_attachments(page)
-    downloaded = download_attachments(page)
+def navigate_and_download(
+    page,
+    client,
+    policy_code,
+    lookup_code="",
+    attachment_name="",
+):
+    """Run one client/policy download job in the current live session."""
+    locate_client(page, client, lookup_code)
+    open_policy_attachments(page, policy_code)
+    downloaded = download_attachments(page, attachment_name)
     if not downloaded:
         log("No documents were downloaded.")
     return downloaded
+
+
+def run_client_worker(context, page):
+    """Keep the authenticated browser alive and process jobs until EXIT."""
+    total_jobs = 0
+    total_downloads = 0
+
+    print("\n" + "=" * 70)
+    print(" APPLIED EPIC DOCUMENT WORKER IS ACTIVE")
+    print(" The same authenticated browser will stay open for every client.")
+    print(" Type EXIT as the client name when you want to close it.")
+    print("=" * 70)
+
+    while True:
+        if page.is_closed():
+            log("The browser was closed. Stopping the worker.")
+            break
+
+        try:
+            client = input(
+                f"\nClient name [{config.CLIENT_NAME}] or EXIT: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            client = "EXIT"
+
+        if client.casefold() in {"exit", "quit", "q"}:
+            break
+        if not client:
+            client = config.CLIENT_NAME
+
+        default_policy = (
+            config.POLICY_CODE
+            if client.casefold() == config.CLIENT_NAME.casefold()
+            else ""
+        )
+        policy_prompt = f"Policy number [{default_policy}]: " if default_policy else "Policy number: "
+        try:
+            policy_code = input(policy_prompt).strip() or default_policy
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if not policy_code:
+            log("A policy number is required. No job was started.")
+            continue
+
+        # The configured lookup/attachment values belong to the configured
+        # default client. Other clients are selected by their result name and
+        # all their attachment rows are attempted.
+        is_default_client = client.casefold() == config.CLIENT_NAME.casefold()
+        lookup_code = config.LOOKUP_CODE if is_default_client else ""
+        attachment_name = config.ATTACHMENT_NAME if is_default_client else ""
+
+        try:
+            # Close any leftover viewer/menu from the previous job.
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
+
+            if not session_is_valid(page):
+                page = authenticate_in_current_context(context, page)
+
+            log(f"Starting job for client={client!r}, policy={policy_code!r}")
+            downloaded = navigate_and_download(
+                page,
+                client,
+                policy_code,
+                lookup_code=lookup_code,
+                attachment_name=attachment_name,
+            )
+            total_jobs += 1
+            total_downloads += len(downloaded)
+            log(
+                f"Job finished: {len(downloaded)} document(s). "
+                "The browser remains active for another client."
+            )
+            save_current_session_storage(context)
+        except Exception as error:
+            log(f"JOB ERROR for {client!r} / {policy_code!r}: {error}")
+            log("The browser remains open. You may enter another client or EXIT.")
+
+    log(
+        f"Worker finished: {total_jobs} successful job(s), "
+        f"{total_downloads} document(s) downloaded."
+    )
 
 
 def main():
@@ -439,8 +546,8 @@ def main():
             # and continue extraction without ending this browser process.
             page = authenticate_in_current_context(context, page)
 
-        log("Navigating to documents...")
-        downloaded = navigate_and_download(page)
+        log("Authentication is ready. Starting the persistent client worker...")
+        run_client_worker(context, page)
         save_current_session_storage(context)
 
         try:
@@ -448,7 +555,7 @@ def main():
         except TypeError:
             context.storage_state(path=str(config.STORAGE_STATE))
 
-        log(f"Done. {len(downloaded)} document(s) downloaded.")
+        log("Closing the Applied Epic browser worker.")
         context.close()
 
 
