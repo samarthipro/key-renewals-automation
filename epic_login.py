@@ -27,7 +27,7 @@ Run:
 from datetime import datetime
 import sys
 
-import config
+import epic_config as config
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
