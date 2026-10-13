@@ -1,40 +1,34 @@
 """
-STEP 2: Fetch policy documents from Applied Epic using the saved session.
+Fetch policy documents from Applied Epic using the authenticated browser state.
 
-What it does
-------------
-1. Loads the authenticated session saved by epic_login.py (storage_state.json),
-   so Epic treats you as already logged in - no push notification needed.
-2. Opens Epic and verifies the session is still valid (not expired).
-3. Follows the recorded navigation flow:
-      Locate -> search client -> open account -> Policies -> open policy
-      -> Access -> Attachments -> open attachment -> Download
-4. Saves downloaded files into DOWNLOAD_DIR.
+Authentication is restored from the persistent Chromium profile created by
+`epic_login.py`, with an explicit sessionStorage restoration because Applied
+Epic/Okta does not keep all login state in ordinary Playwright storage state.
 
-If the saved session has EXPIRED, the script tells you to re-run epic_login.py.
-
-Configurable values (via .env):
-    CLIENT_NAME     - client to search for         (e.g. LOTUS HR)
-    LOOKUP_CODE     - account result row to open    (e.g. LOTUHRI-01)
-    POLICY_CODE     - policy to open                (e.g. KEYPEO00688800)
-    ATTACHMENT_NAME - specific attachment to grab; blank = download all
+Navigation flow:
+    Locate -> client -> Policies -> policy -> Access -> Attachments -> Download
 
 Run:
     python epic_fetch_documents.py
 """
 
 from datetime import datetime
+import json
 import re
 import sys
+import time
 
 import epic_config as config
 
 try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    from playwright.sync_api import sync_playwright
 except ImportError:
-    print("ERROR: Install Playwright:\n"
-          "    pip install playwright\n"
-          "    python -m playwright install chromium", flush=True)
+    print(
+        "ERROR: Install Playwright:\n"
+        "    pip install playwright\n"
+        "    python -m playwright install chromium",
+        flush=True,
+    )
     raise
 
 
@@ -42,69 +36,78 @@ def log(message):
     print(f"[{datetime.now():%H:%M:%S}] {message}", flush=True)
 
 
-def session_is_valid(page):
-    """
-    Return False if Epic bounced us back to a login screen (expired session).
+def install_session_storage(context):
+    """Restore saved sessionStorage before Applied Epic loads."""
+    if not config.SESSION_STORAGE.exists():
+        raise FileNotFoundError(
+            f"Missing {config.SESSION_STORAGE}. Run 'python epic_login.py' "
+            "again to capture the complete authenticated state."
+        )
 
-    Epic's SPA may briefly show a blank/loading state before it checks the
-    saved token and either lands on the home screen OR redirects to the login
-    splash. So we poll for a few seconds: if the 'Login' button (or a password
-    field) appears, the session is expired; if the Locate toolbar appears, we
-    are logged in.
-    """
-    deadline_checks = 15  # ~15 seconds total
-    for _ in range(deadline_checks):
-        # Logged-in signal: the Locate toolbar button is present.
+    state = json.loads(config.SESSION_STORAGE.read_text(encoding="utf-8"))
+    encoded_state = json.dumps(state).replace("</", "<\\/")
+    context.add_init_script(
+        script=f"""
+        (() => {{
+            const allState = {encoded_state};
+            const values = allState[window.location.origin];
+            if (!values) return;
+            for (const [key, value] of Object.entries(values)) {{
+                window.sessionStorage.setItem(key, value);
+            }}
+        }})();
+        """
+    )
+    log(f"Prepared sessionStorage for {len(state)} origin(s).")
+
+
+def session_is_valid(page):
+    """Require a stable Locate toolbar before treating the session as valid."""
+    deadline = time.time() + 30
+    while time.time() < deadline:
         try:
-            if page.get_by_title("Locate (F2)").locator("i").is_visible(timeout=1000):
-                return True
+            login_button = page.get_by_role("button", name="Login")
+            if login_button.is_visible(timeout=500):
+                return False
         except Exception:
             pass
 
-        # Expired signal: the login splash / password field is present.
-        for selector in ("button:has-text('Login')", "input[type='password']"):
-            try:
-                if page.locator(selector).first.is_visible(timeout=500):
-                    return False
-            except Exception:
-                continue
+        try:
+            locate = page.get_by_title("Locate (F2)").locator("i")
+            if locate.is_visible(timeout=800):
+                # Ensure this was not a transient home screen immediately before
+                # an authentication redirect.
+                page.wait_for_timeout(3000)
+                return locate.is_visible(timeout=1000)
+        except Exception:
+            pass
 
         page.wait_for_timeout(1000)
 
-    # Fell through without a clear signal; assume expired to be safe.
     return False
 
 
 def save_download(download, index):
-    """Save a Playwright download into DOWNLOAD_DIR, preserving its name."""
+    """Save a download into DOWNLOAD_DIR without overwriting an older file."""
     suggested = download.suggested_filename or f"document_{index}"
     target = config.DOWNLOAD_DIR / suggested
-
-    # Avoid overwriting: add a counter if a file with the same name exists.
     counter = 1
     while target.exists():
         target = config.DOWNLOAD_DIR / f"{target.stem}_{counter}{target.suffix}"
         counter += 1
-
     download.save_as(str(target))
     log(f"Downloaded: {target.name}")
     return target
 
 
 def locate_client(page):
-    """
-    Locate -> search client by name -> open the matching account row.
-
-    Selectors come from a recorded Playwright session of the real flow.
-    """
+    """Locate the configured client and open its matching account row."""
     client = config.CLIENT_NAME
     log(f"Locating client: {client!r}")
 
-    # Open the Locate screen (toolbar button titled 'Locate (F2)').
-    page.get_by_title("Locate (F2)").locator("i").click()
+    page.get_by_title("Locate (F2)").locator("i").click(timeout=15000)
     page.wait_for_timeout(1500)
 
-    # Type the client name into the first textbox and press Enter.
     search_box = page.get_by_role("textbox").first
     search_box.click()
     search_box.fill(client)
@@ -112,7 +115,6 @@ def locate_client(page):
     log("Submitted the client search.")
     page.wait_for_timeout(3000)
 
-    # Open the matching result row - prefer the lookup code, else the name.
     lookup_code = config.LOOKUP_CODE
     opened = False
     if lookup_code:
@@ -120,156 +122,159 @@ def locate_client(page):
             row = page.locator("div").filter(
                 has_text=re.compile(rf"^{re.escape(lookup_code)}$")
             ).nth(1)
-            row.click()
+            row.click(timeout=15000)
             log(f"Opened account by lookup code: {lookup_code}")
             opened = True
-        except Exception as exc:
-            log(f"Could not open by lookup code ({exc}); trying client name.")
+        except Exception as error:
+            log(f"Could not open by lookup code ({error}); trying client name.")
 
     if not opened:
-        page.get_by_text(client).first.click()
+        page.get_by_text(client).first.click(timeout=15000)
         log(f"Opened account by name: {client}")
 
     page.wait_for_timeout(3000)
 
 
 def open_policy_attachments(page):
-    """
-    Policies -> open policy -> Access -> Attachments.
-
-    Reaches the attachment list for the configured policy.
-    """
-    # Click the 'Policies' link in the account sidebar.
-    page.locator("a").filter(has_text="Policies").click()
+    """Open Policies, choose the configured policy, then open Attachments."""
+    page.locator("a").filter(has_text="Policies").click(timeout=15000)
     log("Opened the Policies section.")
     page.wait_for_timeout(3000)
 
-    # Open the specific policy row by its code.
     policy_code = config.POLICY_CODE
-    page.get_by_text(policy_code).click()
+    page.get_by_text(policy_code).click(timeout=15000)
     log(f"Opened policy: {policy_code}")
     page.wait_for_timeout(2000)
 
-    # Open the 'Access' menu and go to 'Attachments'.
-    page.get_by_title("Access (None)").locator("i").click()
+    page.get_by_title("Access (None)").locator("i").click(timeout=15000)
     page.wait_for_timeout(1000)
-    page.get_by_text("Attachments").first.click()
+    page.get_by_text("Attachments").first.click(timeout=15000)
     log("Opened the policy's Attachments.")
     page.wait_for_timeout(3000)
 
 
 def download_attachments(page):
-    """
-    Download attachment(s) from the policy's Attachments list.
-
-    If ATTACHMENT_NAME is set, download just that one; otherwise download
-    every attachment row found. Each download uses: open the attachment,
-    then click the 'Download' button.
-    """
+    """Download one configured attachment, or attempt every listed row."""
     downloaded = []
     target_name = config.ATTACHMENT_NAME.strip()
 
     def download_one(name):
-        """Open an attachment by name and click Download; save the file."""
         try:
-            page.get_by_text(name).first.dblclick()
+            page.get_by_text(name).first.dblclick(timeout=15000)
             page.wait_for_timeout(1500)
-            with page.expect_download(timeout=30000) as dl_info:
+            with page.expect_download(timeout=30000) as download_info:
                 page.get_by_role("button", name="Download").click()
-            saved = save_download(dl_info.value, len(downloaded) + 1)
-            downloaded.append(saved)
+            downloaded.append(save_download(download_info.value, len(downloaded) + 1))
             return True
-        except Exception as exc:
-            log(f"Could not download {name!r}: {exc}")
+        except Exception as error:
+            log(f"Could not download {name!r}: {error}")
             return False
 
     if target_name:
         log(f"Downloading specific attachment: {target_name!r}")
         download_one(target_name)
-    else:
-        # Download every attachment row. We collect visible row names first.
-        log("No specific attachment set - downloading all listed attachments.")
+        return downloaded
+
+    log("No ATTACHMENT_NAME set; attempting all detected attachment rows.")
+    try:
+        rows = page.get_by_role("row")
+        count = rows.count()
+    except Exception:
+        count = 0
+
+    names = []
+    for index in range(count):
         try:
-            rows = page.get_by_role("row")
-            count = rows.count()
+            text = rows.nth(index).inner_text(timeout=1000).strip()
+            first_line = text.splitlines()[0].strip() if text else ""
+            if first_line and first_line not in names:
+                names.append(first_line)
         except Exception:
-            count = 0
+            continue
 
-        names = []
-        for i in range(count):
-            try:
-                text = rows.nth(i).inner_text(timeout=1000).strip()
-                # Keep rows that look like a document name (skip headers/blank).
-                first_line = text.splitlines()[0].strip() if text else ""
-                if first_line and first_line not in names:
-                    names.append(first_line)
-            except Exception:
-                continue
-
-        if not names:
-            log("No attachment rows detected. Run with HEADLESS=false to "
-                "inspect, or set ATTACHMENT_NAME in .env to target one file.")
-        for name in names:
-            download_one(name)
-
+    if not names:
+        log("No attachment rows detected. Set ATTACHMENT_NAME in .env.")
+    for name in names:
+        download_one(name)
     return downloaded
 
 
+def save_current_session_storage(context):
+    """Refresh saved sessionStorage after a successful run."""
+    saved = {}
+    for page in list(context.pages):
+        try:
+            if not page.url.startswith(("http://", "https://")):
+                continue
+            origin = page.evaluate("window.location.origin")
+            values = page.evaluate(
+                """() => {
+                    const result = {};
+                    for (let i = 0; i < sessionStorage.length; i++) {
+                        const key = sessionStorage.key(i);
+                        result[key] = sessionStorage.getItem(key);
+                    }
+                    return result;
+                }"""
+            )
+            if values:
+                saved[origin] = values
+        except Exception:
+            continue
+    config.SESSION_STORAGE.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+
+
 def navigate_and_download(page):
-    """Full flow: locate client -> open policy attachments -> download."""
     locate_client(page)
     open_policy_attachments(page)
     downloaded = download_attachments(page)
-
     if not downloaded:
         log("No documents were downloaded.")
-        log("Run with HEADLESS=false to watch the flow and adjust selectors,")
-        log("or set ATTACHMENT_NAME in .env to target a specific document.")
-
     return downloaded
 
 
 def main():
-    if not config.STORAGE_STATE.exists():
+    if not config.PROFILE_DIR.exists() or not config.SESSION_STORAGE.exists():
         raise FileNotFoundError(
-            f"No saved session found at {config.STORAGE_STATE}.\n"
-            f"Run 'python epic_login.py' first to log in and save your session."
+            "Complete authenticated browser state was not found. "
+            "Run 'python epic_login.py' with the updated scripts first."
         )
 
     config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     log(f"Documents will be saved to: {config.DOWNLOAD_DIR}")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=config.HEADLESS)
-        context = browser.new_context(
-            storage_state=str(config.STORAGE_STATE),
+    with sync_playwright() as playwright:
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(config.PROFILE_DIR),
+            headless=config.HEADLESS,
             accept_downloads=True,
         )
-        page = context.new_page()
+        install_session_storage(context)
 
-        log("Opening Applied Epic with saved session...")
+        page = context.pages[0] if context.pages else context.new_page()
+        log("Opening Applied Epic with the complete saved browser state...")
         page.goto(config.EPIC_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(4000)  # let the SPA settle
 
         if not session_is_valid(page):
-            browser.close()
+            context.close()
             raise RuntimeError(
-                "Saved session appears to have EXPIRED (Epic is asking you to "
-                "log in again).\nRun 'python epic_login.py' to refresh it, "
-                "then re-run this script."
+                "Applied Epic still shows the Login page. The Okta/Epic session "
+                "has expired or was not fully captured. Close all automation "
+                "browser windows, run 'python epic_login.py', and then run this "
+                "script again."
             )
 
-        log("Session is valid. Navigating to documents...")
+        log("Confirmed authenticated home screen. Navigating to documents...")
         downloaded = navigate_and_download(page)
+        save_current_session_storage(context)
 
-        # Refresh the saved session so its validity window keeps rolling.
         try:
+            context.storage_state(path=str(config.STORAGE_STATE), indexed_db=True)
+        except TypeError:
             context.storage_state(path=str(config.STORAGE_STATE))
-        except Exception:
-            pass
 
         log(f"Done. {len(downloaded)} document(s) downloaded.")
-        browser.close()
+        context.close()
 
 
 if __name__ == "__main__":

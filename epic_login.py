@@ -1,40 +1,32 @@
 """
-STEP 1 (run once): Log in to Applied Epic and save the authenticated session.
+Log in to Applied Epic once and preserve the authenticated browser state.
 
-What it does
-------------
-1. Opens Applied Epic in a VISIBLE browser window.
-2. Pre-fills your username/password from .env (you can also type them yourself).
-3. Waits for YOU to finish logging in and approve the push notification on
-   your phone.
-4. Once you are on the Epic home screen, it saves the browser session
-   (cookies + local storage) to storage_state.json.
+Applied Epic/Okta does not keep all authentication data in ordinary cookies.
+This script therefore preserves three layers after a successful login:
+  1. A persistent Chromium profile (cookies, IndexedDB, service-worker data).
+  2. Playwright storage_state.json (cookies, localStorage, IndexedDB backup).
+  3. sessionStorage values in epic_session_storage.json.
 
-After this, epic_fetch_documents.py reuses that saved session so Epic treats
-you as already logged in and does NOT ask for the push notification again -
-until the session expires. When it expires, just run this script again.
-
-Why a saved session instead of "saving the link"
--------------------------------------------------
-A URL alone does not keep you logged in. The login lives in the browser
-session (cookies/tokens). storage_state.json captures that session so it can
-be replayed on later runs.
-
-Run:
+Run this script again whenever Epic/Okta expires the session:
     python epic_login.py
 """
 
 from datetime import datetime
+import json
 import sys
+import time
 
 import epic_config as config
 
 try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    from playwright.sync_api import sync_playwright
 except ImportError:
-    print("ERROR: Install Playwright:\n"
-          "    pip install playwright\n"
-          "    python -m playwright install chromium", flush=True)
+    print(
+        "ERROR: Install Playwright:\n"
+        "    pip install playwright\n"
+        "    python -m playwright install chromium",
+        flush=True,
+    )
     raise
 
 
@@ -43,41 +35,28 @@ def log(message):
 
 
 def try_click_login_button(page):
-    """
-    The first Applied Epic page is a splash screen with a single 'Login'
-    button (no credential fields yet). Click it to reach the sign-in page.
-
-    Best effort: if the button is not found, you can click it yourself in the
-    browser window.
-    """
-    login_button_selectors = [
+    """Best-effort click of the Applied Epic splash-screen Login button."""
+    selectors = [
         "button:has-text('Login')",
         "a:has-text('Login')",
         "input[value='Login']",
         "text=Login",
     ]
-    for selector in login_button_selectors:
+    for selector in selectors:
         try:
             button = page.locator(selector).first
             if button.is_visible(timeout=2000):
                 button.click()
-                log(f"Clicked the Login button using selector: {selector}")
+                log("Clicked the Applied Epic Login button.")
                 return True
         except Exception:
             continue
-    log("Could not auto-click 'Login' - please click it yourself in the browser.")
+    log("Could not auto-click Login; click it manually in the browser.")
     return False
 
 
 def try_fill_login(page):
-    """
-    Best-effort attempt to pre-fill the username/password fields.
-
-    Applied Epic login markup can vary. If these selectors do not match your
-    tenant, it is harmless - you can simply type the credentials yourself in
-    the opened browser window. Update the selectors below if you want full
-    auto-fill.
-    """
+    """Best-effort credential fill; manual login remains available."""
     username_selectors = [
         "input[type='email']",
         "input[name='username']",
@@ -95,9 +74,9 @@ def try_fill_login(page):
     for selector in username_selectors:
         try:
             field = page.locator(selector).first
-            if field.is_visible(timeout=1500):
+            if field.is_visible(timeout=1000):
                 field.fill(config.EPIC_USERNAME)
-                log(f"Pre-filled username using selector: {selector}")
+                log("Pre-filled the username.")
                 break
         except Exception:
             continue
@@ -105,100 +84,128 @@ def try_fill_login(page):
     for selector in password_selectors:
         try:
             field = page.locator(selector).first
-            if field.is_visible(timeout=1500):
+            if field.is_visible(timeout=1000):
                 field.fill(config.EPIC_PASSWORD)
-                log(f"Pre-filled password using selector: {selector}")
+                log("Pre-filled the password.")
                 break
         except Exception:
             continue
 
 
-def main():
-    log("Launching browser for Applied Epic login...")
-    with sync_playwright() as p:
-        # Always visible here: you need to see the page and approve the push.
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(accept_downloads=True)
-        page = context.new_page()
+def find_logged_in_page(context):
+    """Return the page containing Epic's Locate toolbar, or None."""
+    for page in list(context.pages):
+        try:
+            locate = page.get_by_title("Locate (F2)").locator("i")
+            if locate.is_visible(timeout=800):
+                return page
+        except Exception:
+            continue
+    return None
 
+
+def save_session_storage(context):
+    """Save sessionStorage for every currently open HTTP(S) origin."""
+    saved = {}
+    for page in list(context.pages):
+        try:
+            if not page.url.startswith(("http://", "https://")):
+                continue
+            origin = page.evaluate("window.location.origin")
+            values = page.evaluate(
+                """() => {
+                    const result = {};
+                    for (let i = 0; i < sessionStorage.length; i++) {
+                        const key = sessionStorage.key(i);
+                        result[key] = sessionStorage.getItem(key);
+                    }
+                    return result;
+                }"""
+            )
+            if values:
+                saved[origin] = values
+        except Exception:
+            continue
+
+    config.SESSION_STORAGE.write_text(
+        json.dumps(saved, indent=2), encoding="utf-8"
+    )
+    log(
+        f"Saved sessionStorage for {len(saved)} origin(s): "
+        f"{config.SESSION_STORAGE}"
+    )
+
+
+def save_storage_state(context):
+    """Save cookies/localStorage and IndexedDB where supported."""
+    try:
+        context.storage_state(path=str(config.STORAGE_STATE), indexed_db=True)
+    except TypeError:
+        # Compatibility with older Playwright versions.
+        context.storage_state(path=str(config.STORAGE_STATE))
+    log(f"Saved Playwright storage state: {config.STORAGE_STATE}")
+
+
+def main():
+    config.PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    log("Launching the persistent Applied Epic browser profile...")
+
+    with sync_playwright() as playwright:
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(config.PROFILE_DIR),
+            headless=False,
+            accept_downloads=True,
+        )
+
+        page = context.pages[0] if context.pages else context.new_page()
         log(f"Opening {config.EPIC_URL}")
         page.goto(config.EPIC_URL, wait_until="domcontentloaded")
-
-        # The first page is a splash screen with a 'Login' button.
         page.wait_for_timeout(3000)
-        try_click_login_button(page)
 
-        # After clicking Login, the sign-in page (and its credential fields)
-        # may load, sometimes in a new tab/window. Give it time, then try to
-        # fill the username/password on whichever page is now active.
-        page.wait_for_timeout(4000)
+        # If the persistent profile is already authenticated, do not trigger a
+        # new login. Otherwise click Login and let the user finish Okta/MFA.
+        logged_in_page = find_logged_in_page(context)
+        if logged_in_page is None:
+            try_click_login_button(page)
+            page.wait_for_timeout(4000)
+            sign_in_page = context.pages[-1]
+            if sign_in_page is not page:
+                log("Switched to the Okta sign-in popup.")
+            try_fill_login(sign_in_page)
 
-        # If clicking Login opened a new tab, switch to the newest page.
-        if len(context.pages) > 1:
-            page = context.pages[-1]
-            log("Switched to the new sign-in tab.")
+            print("\n" + "=" * 70)
+            print(" COMPLETE LOGIN IN THE BROWSER:")
+            print("   1. Enter/confirm your username and password.")
+            print("   2. Complete the authorized Okta push/code verification.")
+            print("   3. Wait for the Epic home screen with the Locate toolbar.")
+            print("\n Do not press ENTER here; detection is automatic.")
+            print(
+                f" The script will wait up to {config.LOGIN_TIMEOUT_SECONDS} seconds."
+            )
+            print("=" * 70 + "\n")
 
-        try_fill_login(page)
-
-        print("\n" + "=" * 70)
-        print(" ACTION REQUIRED IN THE BROWSER WINDOW:")
-        print("   1. Click 'Login' if it is still showing.")
-        print("   2. Enter your credentials and approve the PUSH / Okta prompt.")
-        print("   3. Keep going until you reach the Applied Epic HOME screen")
-        print("      (the one with the 'Locate' button in the top toolbar).")
-        print("\n DO NOT touch this terminal. The script will AUTOMATICALLY")
-        print(" detect when you are logged in and then save the session.")
-        print(f" It will wait up to {config.LOGIN_TIMEOUT_SECONDS} seconds.")
-        print("=" * 70 + "\n")
-
-        # Automatically poll until the HOME screen (Locate toolbar) appears on
-        # ANY tab in the context. This replaces the fragile 'press ENTER' step,
-        # which could fire early and save a logged-OUT session.
-        import time
-        deadline = time.time() + config.LOGIN_TIMEOUT_SECONDS
-        logged_in = False
-        main_page = context.pages[0]
-
-        while time.time() < deadline:
-            for pg in list(context.pages):
-                try:
-                    if pg.get_by_title("Locate (F2)").locator("i").is_visible(timeout=800):
-                        main_page = pg
-                        logged_in = True
-                        break
-                except Exception:
-                    continue
-            if logged_in:
-                break
-            log("Waiting for the Epic home screen (Locate toolbar)...")
-            try:
-                main_page.wait_for_timeout(3000)
-            except Exception:
+            deadline = time.time() + config.LOGIN_TIMEOUT_SECONDS
+            while time.time() < deadline:
+                logged_in_page = find_logged_in_page(context)
+                if logged_in_page is not None:
+                    break
+                log("Waiting for the Epic home screen...")
                 time.sleep(3)
 
-        if not logged_in:
-            log("TIMED OUT waiting for the Epic home screen. Session NOT saved.")
-            log("Re-run and make sure you reach the home screen (Locate toolbar)")
-            log("before the timeout. You can increase LOGIN_TIMEOUT_SECONDS in .env.")
-            browser.close()
+        if logged_in_page is None:
+            log("TIMED OUT. No authenticated state was saved.")
+            context.close()
             sys.exit(1)
 
         log("Confirmed: logged in (Locate toolbar is visible).")
+        logged_in_page.bring_to_front()
+        logged_in_page.wait_for_timeout(5000)
 
-        # Let the SPA finish writing auth state to localStorage before saving.
-        try:
-            main_page.bring_to_front()
-            main_page.wait_for_timeout(3000)
-        except Exception:
-            pass
-
-        # Save the authenticated session (cookies + localStorage) from the
-        # context, which covers all tabs/pages.
-        context.storage_state(path=str(config.STORAGE_STATE))
-        log(f"Session saved to: {config.STORAGE_STATE}")
+        save_session_storage(context)
+        save_storage_state(context)
+        log(f"Persistent browser profile saved at: {config.PROFILE_DIR}")
         log("You can now run: python epic_fetch_documents.py")
-
-        browser.close()
+        context.close()
 
 
 if __name__ == "__main__":
