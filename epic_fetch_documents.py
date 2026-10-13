@@ -206,7 +206,21 @@ def save_download(download, index):
 
 
 def find_visible_textbox(page):
-    """Return the first visible textbox on the current Epic screen."""
+    """Return Epic Locate's visible Account/Business-name textbox."""
+    exact_xpaths = [
+        # Selectors captured from Applied Epic; program index varies by screen.
+        "/html/body/root/app/program[2]/div/div[2]/div[2]/div/div/screen/div/div/div/proxy[1]/div/asi-frame/div/div[2]/proxy[5]/div/asi-string-edit/div/input",
+        "/html/body/root/app/program[1]/div/div[2]/div[2]/div/div/screen/div/div/div/proxy[1]/div/asi-frame/div/div[2]/proxy[5]/div/asi-string-edit/div/input",
+    ]
+    for xpath in exact_xpaths:
+        try:
+            box = page.locator(f"xpath={xpath}")
+            if box.is_visible(timeout=500):
+                return box
+        except Exception:
+            continue
+
+    # Semantic fallback if Applied changes the program/proxy indexes.
     boxes = page.get_by_role("textbox")
     try:
         count = boxes.count()
@@ -248,9 +262,29 @@ def click_visible_locate_text(page):
 
 
 def open_locate(page):
-    """Open Locate and verify its textbox, trying reliable UI fallbacks."""
+    """Open Locate and verify its textbox, trying exact XPath first."""
     title_control = page.get_by_title("Locate (F2)")
+    locate_xpath_program_2 = (
+        "/html/body/root/app/program[2]/div/toolbar/div/div[2]/div/"
+        "div[2]/div[1]"
+    )
+    locate_xpath_program_1 = (
+        "/html/body/root/app/program[1]/div/toolbar/div/div[2]/div/"
+        "div[2]/div[1]"
+    )
     attempts = [
+        (
+            "provided Locate XPath (program 2)",
+            lambda: page.locator(f"xpath={locate_xpath_program_2}").click(
+                timeout=10000, force=True
+            ),
+        ),
+        (
+            "provided Locate XPath (program 1)",
+            lambda: page.locator(f"xpath={locate_xpath_program_1}").click(
+                timeout=10000, force=True
+            ),
+        ),
         (
             "Locate toolbar icon",
             lambda: title_control.locator("i").click(timeout=10000, force=True),
@@ -275,10 +309,42 @@ def open_locate(page):
             log(f"Locate attempt failed ({description}): {error}")
 
     raise RuntimeError(
-        "Could not open Epic Locate using the toolbar icon, toolbar control, "
-        "F2 shortcut, or visible Locate label. The authenticated browser was "
-        "on Home, but the Locate screen never exposed its search textbox."
+        "Could not open Epic Locate using the supplied XPath, toolbar controls, "
+        "F2 shortcut, or visible Locate label. The Locate screen never exposed "
+        "its Account/Business-name textbox."
     )
+
+
+def submit_locate_search(page, search_box):
+    """Click the supplied blue Locate button, falling back to Enter."""
+    button_xpaths = [
+        "/html/body/root/app/program[2]/div/div[2]/div[2]/div[1]/div/screen/div/div/div/proxy[1]/div/asi-frame/div/div[2]/proxy[12]/div/asi-button/button",
+        "/html/body/root/app/program[1]/div/div[2]/div[2]/div[1]/div/screen/div/div/div/proxy[1]/div/asi-frame/div/div[2]/proxy[12]/div/asi-button/button",
+    ]
+    for xpath in button_xpaths:
+        try:
+            button = page.locator(f"xpath={xpath}")
+            if button.is_visible(timeout=1000):
+                button.click(timeout=10000)
+                log("Clicked the blue Locate search button using its XPath.")
+                return
+        except Exception:
+            continue
+
+    # Semantic button fallback, then keyboard fallback.
+    buttons = page.get_by_role("button", name="Locate")
+    for index in range(buttons.count()):
+        try:
+            button = buttons.nth(index)
+            if button.is_visible(timeout=300):
+                button.click(timeout=10000)
+                log("Clicked the blue Locate search button by role.")
+                return
+        except Exception:
+            continue
+
+    search_box.press("Enter")
+    log("Locate button was not found; submitted search with Enter.")
 
 
 def locate_client(page, client, lookup_code=""):
@@ -290,7 +356,7 @@ def locate_client(page, client, lookup_code=""):
     search_box = open_locate(page)
     search_box.click()
     search_box.fill(client)
-    search_box.press("Enter")
+    submit_locate_search(page, search_box)
     log("Submitted the client search.")
     page.wait_for_timeout(3000)
 
@@ -329,10 +395,29 @@ def locate_client(page, client, lookup_code=""):
     page.wait_for_timeout(3000)
 
 
+def click_policies(page):
+    """Click Policies using the supplied sidebar XPath with fallbacks."""
+    policy_xpaths = [
+        "/html/body/root/app/program[2]/div/div[2]/div[1]/sidebar/div/div/sidebar-button[6]/div/a",
+        "/html/body/root/app/program[1]/div/div[2]/div[1]/sidebar/div/div/sidebar-button[6]/div/a",
+    ]
+    for xpath in policy_xpaths:
+        try:
+            control = page.locator(f"xpath={xpath}")
+            if control.is_visible(timeout=1000):
+                control.click(timeout=10000)
+                log("Clicked Policies using the supplied sidebar XPath.")
+                return
+        except Exception:
+            continue
+
+    page.locator("a").filter(has_text="Policies").click(timeout=15000)
+    log("Clicked Policies using its visible label.")
+
+
 def open_policy_attachments(page, policy_code):
     """Open Policies, choose the requested policy, then open Attachments."""
-    page.locator("a").filter(has_text="Policies").click(timeout=15000)
-    log("Opened the Policies section.")
+    click_policies(page)
     page.wait_for_timeout(3000)
 
     page.get_by_text(policy_code).click(timeout=15000)
