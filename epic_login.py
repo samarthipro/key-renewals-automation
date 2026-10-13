@@ -159,7 +159,34 @@ def main():
             browser.close()
             sys.exit(1)
 
-        # Save the authenticated session (cookies + localStorage).
+        # Bring focus back to the MAIN Epic tab (login may have used a popup).
+        main_page = context.pages[0]
+        try:
+            main_page.bring_to_front()
+            # Reload so the SPA picks up the freshly stored auth token, then
+            # give it time to land on the home screen and write localStorage.
+            main_page.reload(wait_until="domcontentloaded")
+            main_page.wait_for_timeout(5000)
+        except Exception:
+            pass
+
+        # Verify we are actually logged in before saving (Locate toolbar shows
+        # only when authenticated). Warn - but still save - if we cannot see it.
+        logged_in = False
+        try:
+            logged_in = main_page.get_by_title("Locate (F2)").locator("i").is_visible(timeout=8000)
+        except Exception:
+            logged_in = False
+
+        if logged_in:
+            log("Confirmed: logged in (Locate toolbar is visible).")
+        else:
+            log("WARNING: could not confirm the logged-in home screen.")
+            log("Saving anyway, but if the fetch script shows the login page,")
+            log("re-run this login and make sure you reach the Epic home screen first.")
+
+        # Save the authenticated session (cookies + localStorage) from the
+        # context, which covers all tabs/pages.
         context.storage_state(path=str(config.STORAGE_STATE))
         log(f"Session saved to: {config.STORAGE_STATE}")
         log("You can now run: python epic_fetch_documents.py")

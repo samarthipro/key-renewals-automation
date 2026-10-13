@@ -43,18 +43,36 @@ def log(message):
 
 
 def session_is_valid(page):
-    """Return False if Epic bounced us back to a login screen (expired session)."""
-    login_markers = [
-        "input[type='password']",
-        "button:has-text('Login')",
-    ]
-    for selector in login_markers:
+    """
+    Return False if Epic bounced us back to a login screen (expired session).
+
+    Epic's SPA may briefly show a blank/loading state before it checks the
+    saved token and either lands on the home screen OR redirects to the login
+    splash. So we poll for a few seconds: if the 'Login' button (or a password
+    field) appears, the session is expired; if the Locate toolbar appears, we
+    are logged in.
+    """
+    deadline_checks = 15  # ~15 seconds total
+    for _ in range(deadline_checks):
+        # Logged-in signal: the Locate toolbar button is present.
         try:
-            if page.locator(selector).first.is_visible(timeout=2000):
-                return False
+            if page.get_by_title("Locate (F2)").locator("i").is_visible(timeout=1000):
+                return True
         except Exception:
-            continue
-    return True
+            pass
+
+        # Expired signal: the login splash / password field is present.
+        for selector in ("button:has-text('Login')", "input[type='password']"):
+            try:
+                if page.locator(selector).first.is_visible(timeout=500):
+                    return False
+            except Exception:
+                continue
+
+        page.wait_for_timeout(1000)
+
+    # Fell through without a clear signal; assume expired to be safe.
+    return False
 
 
 def save_download(download, index):
