@@ -1,9 +1,12 @@
 """
 Fetch policy documents from Applied Epic using the authenticated browser state.
 
-Authentication is restored from the persistent Chromium profile created by
-`epic_login.py`, with an explicit sessionStorage restoration because Applied
-Epic/Okta does not keep all login state in ordinary Playwright storage state.
+Authentication behavior:
+- The script first attempts to restore the saved browser state.
+- Some Applied Epic/Okta tenants reject reconstructed state after Chromium
+  exits. If that happens, this script opens the authorized login flow and
+  waits for you to complete Okta, then continues extraction immediately in
+  the SAME browser process. Do not run epic_login.py separately first.
 
 Navigation flow:
     Locate -> client -> Policies -> policy -> Access -> Attachments -> Download
@@ -19,6 +22,13 @@ import sys
 import time
 
 import epic_config as config
+from epic_login import (
+    find_logged_in_page,
+    save_session_storage,
+    save_storage_state,
+    try_click_login_button,
+    try_fill_login,
+)
 
 try:
     from playwright.sync_api import sync_playwright
@@ -122,6 +132,60 @@ def session_is_valid(page):
         page.wait_for_timeout(1000)
 
     return False
+
+
+def authenticate_in_current_context(context, page):
+    """
+    Complete Epic/Okta login and return the authenticated Epic page.
+
+    This deliberately keeps the same Chromium process alive. Some Applied Epic
+    tenants reject a reconstructed session after the browser exits, even when
+    cookies and web storage are restored.
+    """
+    log("Saved authentication was rejected by Applied Epic.")
+    log("Starting login in this same browser; extraction will continue afterward.")
+
+    try_click_login_button(page)
+    page.wait_for_timeout(4000)
+
+    sign_in_page = context.pages[-1]
+    if sign_in_page is not page:
+        log("Switched to the Okta sign-in popup.")
+    try_fill_login(sign_in_page)
+
+    print("\n" + "=" * 70)
+    print(" COMPLETE LOGIN IN THE OPEN BROWSER:")
+    print("   1. Enter/confirm your username and password.")
+    print("   2. Complete the authorized Okta push/code verification.")
+    print("   3. Wait for the Epic home screen with the Locate toolbar.")
+    print("\n Do not close the browser or press ENTER here.")
+    print(" Extraction starts automatically after successful login.")
+    print("=" * 70 + "\n")
+
+    deadline = time.time() + config.LOGIN_TIMEOUT_SECONDS
+    authenticated_page = None
+    while time.time() < deadline:
+        authenticated_page = find_logged_in_page(context)
+        if authenticated_page is not None:
+            break
+        log("Waiting for the Epic home screen...")
+        time.sleep(3)
+
+    if authenticated_page is None:
+        raise RuntimeError(
+            "Timed out waiting for the authenticated Epic home screen. "
+            "Re-run the script and complete Okta before the configured timeout."
+        )
+
+    authenticated_page.bring_to_front()
+    authenticated_page.wait_for_timeout(3000)
+    log("Confirmed authenticated home screen in the live browser session.")
+
+    # Keep backups for diagnostics/future reuse attempts. The extraction below
+    # does not close or replace this authenticated browser process.
+    save_session_storage(context)
+    save_storage_state(context)
+    return authenticated_page
 
 
 def save_download(download, index):
@@ -271,45 +335,36 @@ def navigate_and_download(page):
 
 
 def main():
-    if (
-        not config.PROFILE_DIR.exists()
-        or not config.STORAGE_STATE.exists()
-        or not config.SESSION_STORAGE.exists()
-    ):
-        raise FileNotFoundError(
-            "Complete authenticated browser state was not found. "
-            "Run 'python epic_login.py' with the updated scripts first."
-        )
-
+    config.PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     log(f"Documents will be saved to: {config.DOWNLOAD_DIR}")
 
     with sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=str(config.PROFILE_DIR),
-            headless=config.HEADLESS,
+            headless=False,  # visible because interactive Okta may be required
             accept_downloads=True,
         )
-        install_saved_browser_state(context)
+
+        if config.STORAGE_STATE.exists() and config.SESSION_STORAGE.exists():
+            install_saved_browser_state(context)
+        else:
+            log("No complete saved state found; interactive login will be used.")
 
         page = context.pages[0] if context.pages else context.new_page()
         page.set_default_navigation_timeout(120000)
         page.set_default_timeout(30000)
-        log("Opening Applied Epic with the complete saved browser state...")
-        # Applied Epic is a slow SPA. Wait only for the initial response here;
-        # session_is_valid() below waits for the actual authenticated UI.
+        log("Opening Applied Epic...")
         page.goto(config.EPIC_URL, wait_until="commit", timeout=120000)
 
-        if not session_is_valid(page):
-            context.close()
-            raise RuntimeError(
-                "Applied Epic still shows the Login page. The Okta/Epic session "
-                "has expired or was not fully captured. Close all automation "
-                "browser windows, run 'python epic_login.py', and then run this "
-                "script again."
-            )
+        if session_is_valid(page):
+            log("Reused authenticated home screen from saved browser state.")
+        else:
+            # Applied Epic/Okta rejected the reconstructed state. Authenticate
+            # and continue extraction without ending this browser process.
+            page = authenticate_in_current_context(context, page)
 
-        log("Confirmed authenticated home screen. Navigating to documents...")
+        log("Navigating to documents...")
         downloaded = navigate_and_download(page)
         save_current_session_storage(context)
 
