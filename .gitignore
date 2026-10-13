@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# Security: never commit credentials, sessions, or business data.
+# ---------------------------------------------------------------------------
+
+# Local credentials / config
+.env
+
+# Saved authenticated browser session (contains login cookies/tokens!)
+storage_state.json
+*.storage_state.json
+
+# Playwright persistent browser profile (if used)
+.pw-profile/
+
+# Downloaded documents and workbooks (may contain client/payroll data)
+downloads/
+UW/
+Expiry/
+Quote/
+template/
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.pdf
+
+# Logs and backups
+*.log
+*_backup_*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
