@@ -201,15 +201,90 @@ def save_download(download, index):
     return target
 
 
+def find_visible_textbox(page):
+    """Return the first visible textbox on the current Epic screen."""
+    boxes = page.get_by_role("textbox")
+    try:
+        count = boxes.count()
+    except Exception:
+        return None
+    for index in range(count):
+        try:
+            box = boxes.nth(index)
+            if box.is_visible(timeout=300):
+                return box
+        except Exception:
+            continue
+    return None
+
+
+def wait_for_locate_textbox(page, timeout_seconds=7):
+    """Wait for Locate's Account/Business search textbox."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        box = find_visible_textbox(page)
+        if box is not None:
+            return box
+        page.wait_for_timeout(500)
+    return None
+
+
+def click_visible_locate_text(page):
+    """Click a visible exact 'Locate' toolbar label."""
+    candidates = page.get_by_text("Locate", exact=True)
+    for index in range(candidates.count()):
+        candidate = candidates.nth(index)
+        try:
+            if candidate.is_visible(timeout=300):
+                candidate.click(timeout=5000)
+                return
+        except Exception:
+            continue
+    raise RuntimeError("No visible Locate text control was found.")
+
+
+def open_locate(page):
+    """Open Locate and verify its textbox, trying reliable UI fallbacks."""
+    title_control = page.get_by_title("Locate (F2)")
+    attempts = [
+        (
+            "Locate toolbar icon",
+            lambda: title_control.locator("i").click(timeout=10000, force=True),
+        ),
+        (
+            "Locate toolbar container",
+            lambda: title_control.click(timeout=10000, force=True),
+        ),
+        ("F2 keyboard shortcut", lambda: page.keyboard.press("F2")),
+        ("visible Locate label", lambda: click_visible_locate_text(page)),
+    ]
+
+    for description, action in attempts:
+        try:
+            log(f"Trying to open Locate using: {description}...")
+            action()
+            search_box = wait_for_locate_textbox(page)
+            if search_box is not None:
+                log(f"Locate opened using: {description}.")
+                return search_box
+        except Exception as error:
+            log(f"Locate attempt failed ({description}): {error}")
+
+    raise RuntimeError(
+        "Could not open Epic Locate using the toolbar icon, toolbar control, "
+        "F2 shortcut, or visible Locate label. The authenticated browser was "
+        "on Home, but the Locate screen never exposed its search textbox."
+    )
+
+
 def locate_client(page):
     """Locate the configured client and open its matching account row."""
     client = config.CLIENT_NAME
     log(f"Locating client: {client!r}")
 
-    page.get_by_title("Locate (F2)").locator("i").click(timeout=15000)
-    page.wait_for_timeout(1500)
-
-    search_box = page.get_by_role("textbox").first
+    # Do not assume a click succeeded. open_locate() verifies that the Locate
+    # textbox actually appeared before this function continues.
+    search_box = open_locate(page)
     search_box.click()
     search_box.fill(client)
     search_box.press("Enter")
