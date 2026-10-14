@@ -611,8 +611,8 @@ def visible_search_inputs(page):
     return [candidate for _, candidate in controls]
 
 
-def choose_visible_dropdown_option(page, option, minimum_y):
-    """Mouse-click a visible dropdown option below the search toolbar."""
+def choose_visible_dropdown_option(page, option, toolbar_bottom):
+    """Click a dropdown option, never the similarly named grid header."""
     matches = page.get_by_text(option, exact=True)
     candidates = []
     for index in range(matches.count()):
@@ -621,21 +621,52 @@ def choose_visible_dropdown_option(page, option, minimum_y):
             if not candidate.is_visible(timeout=200):
                 continue
             box = candidate.bounding_box()
-            if box and box["y"] > minimum_y:
+            # The grid header is immediately below the search toolbar. Actual
+            # dropdown options are rendered farther down in the open menu.
+            if box and box["y"] > toolbar_bottom + 35:
                 candidates.append((box["y"], candidate))
         except Exception:
             continue
     if not candidates:
         return False
 
-    # Dropdown options appear below static grid headers with the same text.
-    _, selected = max(candidates, key=lambda item: item[0])
+    _, selected = min(candidates, key=lambda item: item[0])
     mouse_click_locator(page, selected, f"dropdown option {option}")
     return True
 
 
-def select_attachment_dropdown(page, control, option, toolbar_y):
-    """Open an Epic search dropdown and select its requested option."""
+def click_adjacent_dropdown_arrow(page, control, description):
+    """Click the separate arrow immediately right of an Epic combo input."""
+    box = control.bounding_box()
+    if box is None:
+        raise RuntimeError(f"{description} input has no bounding box.")
+
+    # The screenshot shows a ~20px arrow button directly beside the input.
+    x = box["x"] + box["width"] + 10
+    y = box["y"] + box["height"] / 2
+    log(f"Mouse-clicking {description} arrow at ({x:.0f}, {y:.0f}).")
+    page.mouse.move(x, y)
+    page.wait_for_timeout(200)
+    page.mouse.down()
+    page.wait_for_timeout(100)
+    page.mouse.up()
+
+
+def type_dropdown_value(page, control, option):
+    """Fallback: type an option directly into the combo input."""
+    try:
+        control.click(force=True)
+        control.fill(option)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(500)
+        current = control.input_value(timeout=1000).strip()
+        return current.casefold() == option.casefold()
+    except Exception:
+        return False
+
+
+def select_attachment_dropdown(page, control, option, toolbar_bottom):
+    """Select an attachment filter through its separate arrow or direct input."""
     try:
         current = control.input_value(timeout=1000).strip()
         if current.casefold() == option.casefold():
@@ -644,39 +675,29 @@ def select_attachment_dropdown(page, control, option, toolbar_y):
     except Exception:
         pass
 
-    # First try the keyboard-accessible combobox behavior.
-    mouse_click_locator(page, control, f"{option} dropdown")
-    page.keyboard.press("Alt+ArrowDown")
-    page.wait_for_timeout(500)
-    if choose_visible_dropdown_option(page, option, toolbar_y):
-        log(f"Selected attachment filter dropdown: {option}.")
-        return
-
-    # Some Epic combo inputs have a separate arrow in their parent element.
-    parent = control.locator("xpath=..")
+    # Primary path: click the separate arrow highlighted in the screenshot.
     try:
-        mouse_click_locator(page, parent, f"{option} dropdown parent", x_ratio=0.95)
-        page.wait_for_timeout(500)
-        if choose_visible_dropdown_option(page, option, toolbar_y):
+        click_adjacent_dropdown_arrow(page, control, option)
+        page.wait_for_timeout(700)
+        if choose_visible_dropdown_option(page, option, toolbar_bottom):
             log(f"Selected attachment filter dropdown: {option}.")
             return
+    except Exception as error:
+        log(f"Could not use the {option} dropdown arrow: {error}")
+
+    # Close any menu accidentally opened before attempting direct entry.
+    try:
+        page.keyboard.press("Escape")
     except Exception:
         pass
 
-    # Last accessible fallback: type/select through the focused combo.
-    control.click(force=True)
-    page.keyboard.press("Control+A")
-    page.keyboard.type(option)
-    page.keyboard.press("Enter")
-    page.wait_for_timeout(500)
-    try:
-        current = control.input_value(timeout=1000).strip()
-        if current.casefold() == option.casefold():
-            log(f"Selected attachment filter dropdown by keyboard: {option}.")
-            return
-    except Exception:
-        pass
-    raise RuntimeError(f"Could not select {option!r} in the attachment filter.")
+    if type_dropdown_value(page, control, option):
+        log(f"Typed attachment filter dropdown value: {option}.")
+        return
+
+    raise RuntimeError(
+        f"Could not select or type {option!r} in the attachment filter."
+    )
 
 
 def apply_policy_attachment_filter(page):
