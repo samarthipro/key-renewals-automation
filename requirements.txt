@@ -1,3 +1,4 @@
 pywin32>=306
 playwright>=1.47
 python-dotenv>=1.0
+pdfplumber>=0.11
