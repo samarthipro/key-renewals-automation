@@ -66,8 +66,7 @@ LOOKUP_CODE = os.getenv("LOOKUP_CODE", "LOTUHRI-01")
 # The policy code to open under the client's Policies list.
 POLICY_CODE = os.getenv("POLICY_CODE", "KEYPEO00688800")
 
-# The attachment (document) name to download under the policy's Attachments.
-# Leave blank to download EVERY attachment listed for the policy.
+# Exact attachment name. Blank means every visible name ending in "Policy".
 ATTACHMENT_NAME = os.getenv("ATTACHMENT_NAME", "")
 
 # Use installed Google Chrome for Applied Epic compatibility. Set this blank

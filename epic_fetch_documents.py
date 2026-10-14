@@ -571,49 +571,142 @@ def open_policy_attachments(page, policy_code):
     page.wait_for_timeout(3000)
 
 
-def download_attachments(page, target_name=""):
-    """Download one requested attachment, or attempt every listed row."""
-    downloaded = []
-    target_name = target_name.strip()
-
-    def download_one(name):
+def find_visible_exact_text(page, text):
+    """Return the smallest visible exact-text match for a document name."""
+    matches = page.get_by_text(text, exact=True)
+    visible = []
+    for index in range(matches.count()):
+        candidate = matches.nth(index)
         try:
-            page.get_by_text(name).first.dblclick(timeout=15000)
-            page.wait_for_timeout(1500)
-            with page.expect_download(timeout=30000) as download_info:
-                page.get_by_role("button", name="Download").click()
-            downloaded.append(save_download(download_info.value, len(downloaded) + 1))
-            return True
-        except Exception as error:
-            log(f"Could not download {name!r}: {error}")
-            return False
-
-    if target_name:
-        log(f"Downloading specific attachment: {target_name!r}")
-        download_one(target_name)
-        return downloaded
-
-    log("No ATTACHMENT_NAME set; attempting all detected attachment rows.")
-    try:
-        rows = page.get_by_role("row")
-        count = rows.count()
-    except Exception:
-        count = 0
-
-    names = []
-    for index in range(count):
-        try:
-            text = rows.nth(index).inner_text(timeout=1000).strip()
-            first_line = text.splitlines()[0].strip() if text else ""
-            if first_line and first_line not in names:
-                names.append(first_line)
+            if candidate.is_visible(timeout=300):
+                box = candidate.bounding_box()
+                if box:
+                    visible.append((box["width"] * box["height"], candidate))
         except Exception:
             continue
+    return min(visible, key=lambda item: item[0])[1] if visible else None
+
+
+def double_click_document(page, document):
+    """Open an attachment using a trusted low-level mouse double-click."""
+    box = document.bounding_box()
+    if box is None:
+        raise RuntimeError("Document row has no clickable bounding box.")
+    x = box["x"] + box["width"] / 2
+    y = box["y"] + box["height"] / 2
+    log(f"Double-clicking document at ({x:.0f}, {y:.0f}).")
+    page.mouse.move(x, y)
+    page.mouse.click(x, y, click_count=2, delay=120)
+
+
+def wait_for_download_button(context, original_page, timeout_seconds=20):
+    """Find Download in either an Epic modal or a newly opened popup page."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        pages = list(reversed(context.pages))
+        if original_page not in pages:
+            pages.append(original_page)
+        for candidate_page in pages:
+            if candidate_page.is_closed():
+                continue
+            try:
+                buttons = candidate_page.get_by_role(
+                    "button", name="Download", exact=True
+                )
+                for index in range(buttons.count()):
+                    button = buttons.nth(index)
+                    if button.is_visible(timeout=300):
+                        return candidate_page, button
+            except Exception:
+                continue
+        original_page.wait_for_timeout(500)
+    return None, None
+
+
+def policy_document_names(page):
+    """Return unique visible attachment names whose text ends with Policy."""
+    pattern = re.compile(r".+\bPolicy\s*$", re.IGNORECASE)
+    matches = page.get_by_text(pattern)
+    names = []
+    for index in range(matches.count()):
+        candidate = matches.nth(index)
+        try:
+            if not candidate.is_visible(timeout=300):
+                continue
+            text = " ".join(candidate.inner_text(timeout=1000).split())
+            if pattern.fullmatch(text) and text not in names:
+                names.append(text)
+        except Exception:
+            continue
+    return names
+
+
+def download_attachments(page, target_name=""):
+    """Download a named document or every visible name ending in 'Policy'."""
+    downloaded = []
+    target_name = target_name.strip()
+    names = [target_name] if target_name else policy_document_names(page)
+
+    if target_name:
+        log(f"Searching for the configured attachment: {target_name!r}")
+    else:
+        log("Searching for attachment names ending in 'Policy'.")
 
     if not names:
-        log("No attachment rows detected. Set ATTACHMENT_NAME in .env.")
+        log("No visible attachment name ending in 'Policy' was found.")
+        return downloaded
+
+    log(f"Matched {len(names)} policy document(s): {names}")
+
     for name in names:
-        download_one(name)
+        try:
+            document = find_visible_exact_text(page, name)
+            if document is None:
+                raise RuntimeError("The document name is no longer visible.")
+
+            pages_before = set(page.context.pages)
+            double_click_document(page, document)
+
+            dialog_page, download_button = wait_for_download_button(
+                page.context, page
+            )
+            if download_button is None:
+                raise RuntimeError(
+                    "Double-click succeeded, but no visible Download button "
+                    "appeared in the modal or popup."
+                )
+
+            with dialog_page.expect_download(timeout=60000) as download_info:
+                mouse_click_locator(
+                    dialog_page,
+                    download_button,
+                    "Download dialog button",
+                )
+
+            saved = save_download(download_info.value, len(downloaded) + 1)
+            downloaded.append(saved)
+
+            # Close only a popup created for this document. An in-page Epic
+            # modal normally closes itself after Download; Escape is a fallback.
+            new_pages = [
+                candidate
+                for candidate in page.context.pages
+                if candidate not in pages_before and candidate is not page
+            ]
+            for popup in new_pages:
+                try:
+                    popup.close()
+                except Exception:
+                    pass
+            if dialog_page is page:
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+            page.wait_for_timeout(1500)
+        except Exception as error:
+            log(f"Could not download {name!r}: {error}")
+
     return downloaded
 
 
