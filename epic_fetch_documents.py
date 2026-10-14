@@ -652,51 +652,95 @@ def click_adjacent_dropdown_arrow(page, control, description):
     page.mouse.up()
 
 
-def type_dropdown_value(page, control, option):
-    """Fallback: type an option directly into the combo input."""
+def dropdown_has_value(control, option):
+    """Return whether a combo input visibly contains the requested value."""
     try:
-        control.click(force=True)
-        control.fill(option)
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(500)
         current = control.input_value(timeout=1000).strip()
         return current.casefold() == option.casefold()
     except Exception:
         return False
 
 
-def select_attachment_dropdown(page, control, option, toolbar_bottom):
-    """Select an attachment filter through its separate arrow or direct input."""
+def type_dropdown_value(page, control, option):
+    """Type an option directly and verify that the combo displays it."""
     try:
-        current = control.input_value(timeout=1000).strip()
-        if current.casefold() == option.casefold():
-            log(f"Attachment filter dropdown already selected: {option}.")
-            return
+        control.click(force=True)
+        control.fill(option)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(700)
+        if dropdown_has_value(control, option):
+            return True
     except Exception:
         pass
 
-    # Primary path: click the separate arrow highlighted in the screenshot.
+    # Fallback for custom Epic inputs that intercept Playwright.fill(). Use the
+    # native value setter while still dispatching input/change events so Epic's
+    # component model receives the update.
+    try:
+        control.evaluate(
+            """(element, value) => {
+                const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(element, value);
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                element.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'Enter', code: 'Enter', bubbles: true
+                }));
+                element.dispatchEvent(new KeyboardEvent('keyup', {
+                    key: 'Enter', code: 'Enter', bubbles: true
+                }));
+            }""",
+            option,
+        )
+        page.wait_for_timeout(700)
+        return dropdown_has_value(control, option)
+    except Exception:
+        return False
+
+
+def select_attachment_dropdown(page, control, option, toolbar_bottom):
+    """Select an attachment filter and verify its displayed input value."""
+    if dropdown_has_value(control, option):
+        log(f"Attachment filter dropdown already selected: {option}.")
+        return
+
+    # Description is known to be an editable first combo. Type it first so the
+    # script does not accidentally choose the Description grid header.
+    if option.casefold() == "description" and type_dropdown_value(
+        page, control, option
+    ):
+        log("Typed and verified first attachment filter: Description.")
+        return
+
+    # Click the separate arrow highlighted in the screenshot.
     try:
         click_adjacent_dropdown_arrow(page, control, option)
         page.wait_for_timeout(700)
         if choose_visible_dropdown_option(page, option, toolbar_bottom):
-            log(f"Selected attachment filter dropdown: {option}.")
-            return
+            page.wait_for_timeout(700)
+            if dropdown_has_value(control, option):
+                log(f"Selected and verified attachment filter: {option}.")
+                return
+            log(
+                f"Clicked a {option} text match, but the dropdown did not "
+                "display that value; retrying by direct entry."
+            )
     except Exception as error:
         log(f"Could not use the {option} dropdown arrow: {error}")
 
-    # Close any menu accidentally opened before attempting direct entry.
     try:
         page.keyboard.press("Escape")
     except Exception:
         pass
 
     if type_dropdown_value(page, control, option):
-        log(f"Typed attachment filter dropdown value: {option}.")
+        log(f"Typed and verified attachment filter: {option}.")
         return
 
     raise RuntimeError(
-        f"Could not select or type {option!r} in the attachment filter."
+        f"Could not make the attachment filter display {option!r}."
     )
 
 
@@ -717,7 +761,24 @@ def apply_policy_attachment_filter(page):
     controls = visible_search_inputs(page)
     select_attachment_dropdown(page, controls[1], "Contains", toolbar_y)
 
+    # Final verification: never run Find while Description is blank. Retry each
+    # field once after all combo re-renders, then require both visible values.
     controls = visible_search_inputs(page)
+    if not dropdown_has_value(controls[0], "Description"):
+        log("First filter became blank; forcing Description again.")
+        select_attachment_dropdown(page, controls[0], "Description", toolbar_y)
+
+    controls = visible_search_inputs(page)
+    if not dropdown_has_value(controls[1], "Contains"):
+        log("Second filter became blank; forcing Contains again.")
+        select_attachment_dropdown(page, controls[1], "Contains", toolbar_y)
+
+    controls = visible_search_inputs(page)
+    if not dropdown_has_value(controls[0], "Description"):
+        raise RuntimeError("First attachment filter is still blank, not Description.")
+    if not dropdown_has_value(controls[1], "Contains"):
+        raise RuntimeError("Second attachment filter is still blank, not Contains.")
+
     search_value = controls[2]
     search_value.click(force=True)
     search_value.fill("policy")
