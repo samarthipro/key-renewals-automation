@@ -27,6 +27,7 @@ import time
 
 import epic_config as config
 from epic_login import (
+    concurrent_login_warning_visible,
     find_logged_in_page,
     save_session_storage,
     save_storage_state,
@@ -168,7 +169,19 @@ def authenticate_in_current_context(context, page):
 
     deadline = time.time() + config.LOGIN_TIMEOUT_SECONDS
     authenticated_page = None
+    takeover_warning_announced = False
     while time.time() < deadline:
+        # A Yes button here means this account is active on another device.
+        # Bring it forward but leave the takeover decision to the user.
+        for candidate_page in list(context.pages):
+            if concurrent_login_warning_visible(candidate_page):
+                candidate_page.bring_to_front()
+                if not takeover_warning_announced:
+                    log(
+                        "Epic reports this account is active elsewhere. "
+                        "Choose Yes or No manually in the browser."
+                    )
+                    takeover_warning_announced = True
         authenticated_page = find_logged_in_page(context)
         if authenticated_page is not None:
             break
@@ -183,7 +196,7 @@ def authenticate_in_current_context(context, page):
 
     authenticated_page.bring_to_front()
     authenticated_page.wait_for_timeout(3000)
-    log("Confirmed authenticated home screen in the live browser session.")
+    log("Confirmed authenticated home screen with no takeover decision pending.")
 
     # Keep backups for diagnostics/future reuse attempts. The extraction below
     # does not close or replace this authenticated browser process.
@@ -203,6 +216,40 @@ def save_download(download, index):
     download.save_as(str(target))
     log(f"Downloaded: {target.name}")
     return target
+
+
+def mouse_click_locator(page, locator, description, x_ratio=0.5, y_ratio=0.5):
+    """Click a visible locator using Playwright's low-level mouse events."""
+    locator.scroll_into_view_if_needed(timeout=5000)
+    box = locator.bounding_box()
+    if box is None or box["width"] <= 0 or box["height"] <= 0:
+        raise RuntimeError(f"{description} has no clickable bounding box.")
+
+    x = box["x"] + box["width"] * x_ratio
+    y = box["y"] + box["height"] * y_ratio
+    log(
+        f"Mouse-clicking {description} at ({x:.0f}, {y:.0f}); "
+        f"box={box}."
+    )
+    page.mouse.move(x, y)
+    page.wait_for_timeout(250)
+    page.mouse.down()
+    page.wait_for_timeout(100)
+    page.mouse.up()
+
+
+def mouse_click_first_visible(page, locator, description):
+    """Mouse-click the first visible match and return True when found."""
+    count = locator.count()
+    for index in range(count):
+        candidate = locator.nth(index)
+        try:
+            if candidate.is_visible(timeout=300):
+                mouse_click_locator(page, candidate, f"{description}[{index}]")
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def find_visible_textbox(page):
@@ -261,8 +308,67 @@ def click_visible_locate_text(page):
     raise RuntimeError("No visible Locate text control was found.")
 
 
+def click_active_program_locate(page):
+    """Click Locate inside Epic's currently visible program tree."""
+    active_program = page.locator("root app program:visible").last
+    control = active_program.locator('[title="Locate (F2)"]').first
+    icon = control.locator("i").first
+    if icon.is_visible(timeout=3000):
+        icon.click(timeout=10000)
+    else:
+        control.click(timeout=10000)
+
+
+def javascript_click_active_locate(page):
+    """Invoke the visible Locate control's DOM click handler directly."""
+    control = (
+        page.locator("root app program:visible")
+        .last.locator('[title="Locate (F2)"]')
+        .first
+    )
+    control.evaluate("element => element.click()")
+
+
+def coordinate_click_active_locate(page):
+    """Mouse-click the first visible title-matched Locate control."""
+    controls = page.locator('[title="Locate (F2)"]')
+    if not mouse_click_first_visible(page, controls, "Locate title control"):
+        raise RuntimeError("No visible title-matched Locate control was found.")
+
+
+def calibrated_click_locate(page):
+    """Use the screenshot-calibrated toolbar coordinates as a last fallback."""
+    x = config.LOCATE_CLICK_X
+    y = config.LOCATE_CLICK_Y
+    log(f"Mouse-clicking configured Locate coordinates ({x}, {y}).")
+    page.mouse.move(x, y)
+    page.wait_for_timeout(250)
+    page.mouse.down()
+    page.wait_for_timeout(100)
+    page.mouse.up()
+
+
+def dispatch_f2(page):
+    """Send F2 through Playwright and dispatch the corresponding DOM events."""
+    page.bring_to_front()
+    page.keyboard.press("F2")
+    page.evaluate(
+        """() => {
+            const options = {
+                key: 'F2', code: 'F2', keyCode: 113, which: 113,
+                bubbles: true, cancelable: true
+            };
+            for (const target of [document.activeElement, document.body, document, window]) {
+                if (!target) continue;
+                target.dispatchEvent(new KeyboardEvent('keydown', options));
+                target.dispatchEvent(new KeyboardEvent('keyup', options));
+            }
+        }"""
+    )
+
+
 def open_locate(page):
-    """Open Locate and verify its textbox, trying exact XPath first."""
+    """Open Locate and verify its textbox, targeting the active program."""
     title_control = page.get_by_title("Locate (F2)")
     locate_xpath_program_2 = (
         "/html/body/root/app/program[2]/div/toolbar/div/div[2]/div/"
@@ -273,6 +379,10 @@ def open_locate(page):
         "div[2]/div[1]"
     )
     attempts = [
+        ("visible Epic program Locate control", lambda: click_active_program_locate(page)),
+        ("visible Locate DOM handler", lambda: javascript_click_active_locate(page)),
+        ("visible Locate screen coordinates", lambda: coordinate_click_active_locate(page)),
+        ("configured Locate page coordinates", lambda: calibrated_click_locate(page)),
         (
             "provided Locate XPath (program 2)",
             lambda: page.locator(f"xpath={locate_xpath_program_2}").click(
@@ -293,7 +403,7 @@ def open_locate(page):
             "Locate toolbar container",
             lambda: title_control.click(timeout=10000, force=True),
         ),
-        ("F2 keyboard shortcut", lambda: page.keyboard.press("F2")),
+        ("F2 keyboard and DOM events", lambda: dispatch_f2(page)),
         ("visible Locate label", lambda: click_visible_locate_text(page)),
     ]
 
@@ -308,10 +418,31 @@ def open_locate(page):
         except Exception as error:
             log(f"Locate attempt failed ({description}): {error}")
 
+    # Do not terminate the authenticated worker during selector tuning. Report
+    # useful DOM counts and allow one manual Locate click while polling for the
+    # same search textbox; all later steps remain automated.
+    try:
+        visible_programs = page.locator("root app program:visible").count()
+        titled_controls = page.locator('[title="Locate (F2)"]').count()
+        log(
+            f"Locate diagnostics: url={page.url!r}, "
+            f"visible_programs={visible_programs}, "
+            f"title_controls={titled_controls}."
+        )
+    except Exception:
+        pass
+
+    log("Automatic Locate clicks did not open the screen.")
+    log("Click Locate once in the open browser; waiting up to 60 seconds...")
+    search_box = wait_for_locate_textbox(page, timeout_seconds=60)
+    if search_box is not None:
+        log("Detected the Locate screen after the manual click; continuing.")
+        return search_box
+
     raise RuntimeError(
-        "Could not open Epic Locate using the supplied XPath, toolbar controls, "
-        "F2 shortcut, or visible Locate label. The Locate screen never exposed "
-        "its Account/Business-name textbox."
+        "Locate did not open automatically or during the 60-second manual "
+        "fallback. The authenticated worker will remain available for another "
+        "job."
     )
 
 
@@ -325,7 +456,7 @@ def submit_locate_search(page, search_box):
         try:
             button = page.locator(f"xpath={xpath}")
             if button.is_visible(timeout=1000):
-                button.click(timeout=10000)
+                mouse_click_locator(page, button, "blue Locate search button")
                 log("Clicked the blue Locate search button using its XPath.")
                 return
         except Exception:
@@ -337,7 +468,7 @@ def submit_locate_search(page, search_box):
         try:
             button = buttons.nth(index)
             if button.is_visible(timeout=300):
-                button.click(timeout=10000)
+                mouse_click_locator(page, button, "Locate button by role")
                 log("Clicked the blue Locate search button by role.")
                 return
         except Exception:
@@ -405,13 +536,15 @@ def click_policies(page):
         try:
             control = page.locator(f"xpath={xpath}")
             if control.is_visible(timeout=1000):
-                control.click(timeout=10000)
+                mouse_click_locator(page, control, "Policies sidebar control")
                 log("Clicked Policies using the supplied sidebar XPath.")
                 return
         except Exception:
             continue
 
-    page.locator("a").filter(has_text="Policies").click(timeout=15000)
+    fallback = page.locator("a").filter(has_text="Policies")
+    if not mouse_click_first_visible(page, fallback, "Policies visible label"):
+        raise RuntimeError("No visible Policies control was found.")
     log("Clicked Policies using its visible label.")
 
 
@@ -420,13 +553,20 @@ def open_policy_attachments(page, policy_code):
     click_policies(page)
     page.wait_for_timeout(3000)
 
-    page.get_by_text(policy_code).click(timeout=15000)
+    policy_matches = page.get_by_text(policy_code, exact=False)
+    if not mouse_click_first_visible(page, policy_matches, f"policy {policy_code}"):
+        raise RuntimeError(f"Policy {policy_code!r} was not visible in Policies.")
     log(f"Opened policy: {policy_code}")
     page.wait_for_timeout(2000)
 
-    page.get_by_title("Access (None)").locator("i").click(timeout=15000)
+    access = page.get_by_title("Access (None)")
+    if not mouse_click_first_visible(page, access, "Access toolbar control"):
+        raise RuntimeError("The Access toolbar control was not visible.")
     page.wait_for_timeout(1000)
-    page.get_by_text("Attachments").first.click(timeout=15000)
+
+    attachments = page.get_by_text("Attachments", exact=True)
+    if not mouse_click_first_visible(page, attachments, "Attachments menu item"):
+        raise RuntimeError("The Attachments menu item was not visible.")
     log("Opened the policy's Attachments.")
     page.wait_for_timeout(3000)
 
@@ -610,6 +750,9 @@ def main():
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=str(config.PROFILE_DIR),
             headless=False,  # visible because interactive Okta may be required
+            channel=config.BROWSER_CHANNEL,
+            args=["--start-maximized"],
+            no_viewport=True,
             accept_downloads=True,
         )
 

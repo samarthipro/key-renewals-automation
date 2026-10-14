@@ -70,6 +70,20 @@ POLICY_CODE = os.getenv("POLICY_CODE", "KEYPEO00688800")
 # Leave blank to download EVERY attachment listed for the policy.
 ATTACHMENT_NAME = os.getenv("ATTACHMENT_NAME", "")
 
+# Use installed Google Chrome for Applied Epic compatibility. Set this blank
+# only if Chrome is unavailable and Playwright's bundled Chromium is required.
+BROWSER_CHANNEL = os.getenv("EPIC_BROWSER_CHANNEL", "chrome").strip() or None
+
+# External normal-Chrome/CDP worker configuration.
+CDP_PORT = int(os.getenv("EPIC_CDP_PORT", "9222"))
+CHROME_PATH = os.getenv("EPIC_CHROME_PATH", "").strip()
+
+# Fallback page coordinates for Epic's blue-toolbar Locate control. These are
+# Playwright viewport coordinates (not Windows screen coordinates) and can be
+# adjusted locally if the toolbar layout differs.
+LOCATE_CLICK_X = int(os.getenv("EPIC_LOCATE_CLICK_X", "282"))
+LOCATE_CLICK_Y = int(os.getenv("EPIC_LOCATE_CLICK_Y", "94"))
+
 # Behaviour toggles.
 LOGIN_TIMEOUT_SECONDS = int(os.getenv("LOGIN_TIMEOUT_SECONDS", "300"))
 HEADLESS = os.getenv("HEADLESS", "false").strip().lower() in ("1", "true", "yes")

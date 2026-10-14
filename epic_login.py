@@ -92,10 +92,26 @@ def try_fill_login(page):
             continue
 
 
+def concurrent_login_warning_visible(page):
+    """Return True when Epic asks whether to take over another login."""
+    try:
+        yes_buttons = page.get_by_role("button", name="Yes", exact=True)
+        return any(
+            yes_buttons.nth(index).is_visible(timeout=300)
+            for index in range(yes_buttons.count())
+        )
+    except Exception:
+        return False
+
+
 def find_logged_in_page(context):
-    """Return the page containing Epic's Locate toolbar, or None."""
+    """Return an unlocked page containing Epic's Locate toolbar, or None."""
     for page in list(context.pages):
         try:
+            # A visible Yes means another-device takeover is awaiting the
+            # user's decision. Do not automate that decision or start work yet.
+            if concurrent_login_warning_visible(page):
+                continue
             locate = page.get_by_title("Locate (F2)").locator("i")
             if locate.is_visible(timeout=800):
                 return page
@@ -154,6 +170,9 @@ def main():
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=str(config.PROFILE_DIR),
             headless=False,
+            channel=config.BROWSER_CHANNEL,
+            args=["--start-maximized"],
+            no_viewport=True,
             accept_downloads=True,
         )
 
@@ -190,7 +209,19 @@ def main():
             print("=" * 70 + "\n")
 
             deadline = time.time() + config.LOGIN_TIMEOUT_SECONDS
+            takeover_warning_announced = False
             while time.time() < deadline:
+                # If this account is active elsewhere, Epic asks the user
+                # whether to take over. Leave that decision to the user.
+                for candidate_page in list(context.pages):
+                    if concurrent_login_warning_visible(candidate_page):
+                        candidate_page.bring_to_front()
+                        if not takeover_warning_announced:
+                            log(
+                                "Epic reports this account is active elsewhere. "
+                                "Choose Yes or No manually in the browser."
+                            )
+                            takeover_warning_announced = True
                 logged_in_page = find_logged_in_page(context)
                 if logged_in_page is not None:
                     break
@@ -202,9 +233,9 @@ def main():
             context.close()
             sys.exit(1)
 
-        log("Confirmed: logged in (Locate toolbar is visible).")
+        log("Confirmed: logged in and no takeover decision is pending.")
         logged_in_page.bring_to_front()
-        logged_in_page.wait_for_timeout(5000)
+        logged_in_page.wait_for_timeout(3000)
 
         save_session_storage(context)
         save_storage_state(context)
