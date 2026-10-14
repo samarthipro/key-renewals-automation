@@ -571,6 +571,38 @@ def open_policy_attachments(page, policy_code):
     page.wait_for_timeout(3000)
 
 
+def find_description_filter_input(page):
+    """Find the first attachment filter using the captured exact XPath."""
+    xpaths = [
+        # Exact path captured from the live Attachments screen.
+        "/html/body/root/app/program[3]/div/div[3]/div[2]/div/div/screen/div/div/div/proxy/div/asi-frame/div/div[2]/proxy[6]/div/asi-panel/div/proxy[3]/div/asi-virtual-list-view/div/filter-fields/div/filter-fields-form/div/asi-combo-box[1]/div/input",
+        # Program indexes can change between Epic screens/sessions.
+        "/html/body/root/app/program[2]/div/div[3]/div[2]/div/div/screen/div/div/div/proxy/div/asi-frame/div/div[2]/proxy[6]/div/asi-panel/div/proxy[3]/div/asi-virtual-list-view/div/filter-fields/div/filter-fields-form/div/asi-combo-box[1]/div/input",
+        "/html/body/root/app/program[1]/div/div[3]/div[2]/div/div/screen/div/div/div/proxy/div/asi-frame/div/div[2]/proxy[6]/div/asi-panel/div/proxy[3]/div/asi-virtual-list-view/div/filter-fields/div/filter-fields-form/div/asi-combo-box[1]/div/input",
+    ]
+    for xpath in xpaths:
+        try:
+            control = page.locator(f"xpath={xpath}")
+            if control.is_visible(timeout=500):
+                return control
+        except Exception:
+            continue
+
+    # Structural fallback independent of the current program number.
+    structural = page.locator(
+        "root app program:visible filter-fields-form "
+        "asi-combo-box:nth-of-type(1) input"
+    )
+    for index in range(structural.count()):
+        try:
+            control = structural.nth(index)
+            if control.is_visible(timeout=300):
+                return control
+        except Exception:
+            continue
+    return None
+
+
 def visible_search_inputs(page):
     """Find and left-to-right sort inputs on the Attachments search row."""
     labels = page.get_by_text("Search where", exact=True)
@@ -611,27 +643,42 @@ def visible_search_inputs(page):
     return [candidate for _, candidate in controls]
 
 
-def choose_visible_dropdown_option(page, option, toolbar_bottom):
-    """Click a dropdown option, never the similarly named grid header."""
+def choose_visible_dropdown_option(page, control, option, toolbar_bottom):
+    """Click an option only inside the dropdown aligned with its input."""
+    control_box = control.bounding_box()
+    if control_box is None:
+        return False
+
     matches = page.get_by_text(option, exact=True)
     candidates = []
+    minimum_x = control_box["x"] - 20
+    maximum_x = control_box["x"] + control_box["width"] + 100
+
     for index in range(matches.count()):
         candidate = matches.nth(index)
         try:
             if not candidate.is_visible(timeout=200):
                 continue
             box = candidate.bounding_box()
-            # The grid header is immediately below the search toolbar. Actual
-            # dropdown options are rendered farther down in the open menu.
-            if box and box["y"] > toolbar_bottom + 35:
+            if not box:
+                continue
+
+            # Reject the grid's Description column header. The actual option is
+            # rendered below the toolbar and horizontally aligned with the
+            # first combo input/dropdown popup.
+            if (
+                box["y"] > toolbar_bottom + 35
+                and minimum_x <= box["x"] <= maximum_x
+            ):
                 candidates.append((box["y"], candidate))
         except Exception:
             continue
+
     if not candidates:
         return False
 
     _, selected = min(candidates, key=lambda item: item[0])
-    mouse_click_locator(page, selected, f"dropdown option {option}")
+    mouse_click_locator(page, selected, f"actual {option} dropdown option")
     return True
 
 
@@ -652,51 +699,137 @@ def click_adjacent_dropdown_arrow(page, control, description):
     page.mouse.up()
 
 
-def type_dropdown_value(page, control, option):
-    """Fallback: type an option directly into the combo input."""
+def dropdown_has_value(control, option):
+    """Return whether a combo input visibly contains the requested value."""
     try:
-        control.click(force=True)
-        control.fill(option)
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(500)
         current = control.input_value(timeout=1000).strip()
         return current.casefold() == option.casefold()
     except Exception:
         return False
 
 
-def select_attachment_dropdown(page, control, option, toolbar_bottom):
-    """Select an attachment filter through its separate arrow or direct input."""
+def type_dropdown_value(page, control, option):
+    """Type an option directly and verify that the combo displays it."""
     try:
-        current = control.input_value(timeout=1000).strip()
-        if current.casefold() == option.casefold():
-            log(f"Attachment filter dropdown already selected: {option}.")
-            return
+        control.click(force=True)
+        control.fill(option)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(700)
+        if dropdown_has_value(control, option):
+            return True
     except Exception:
         pass
 
-    # Primary path: click the separate arrow highlighted in the screenshot.
+    # Fallback for custom Epic inputs that intercept Playwright.fill(). Use the
+    # native value setter while still dispatching input/change events so Epic's
+    # component model receives the update.
     try:
-        click_adjacent_dropdown_arrow(page, control, option)
+        control.evaluate(
+            """(element, value) => {
+                const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(element, value);
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                element.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'Enter', code: 'Enter', bubbles: true
+                }));
+                element.dispatchEvent(new KeyboardEvent('keyup', {
+                    key: 'Enter', code: 'Enter', bubbles: true
+                }));
+            }""",
+            option,
+        )
         page.wait_for_timeout(700)
-        if choose_visible_dropdown_option(page, option, toolbar_bottom):
-            log(f"Selected attachment filter dropdown: {option}.")
-            return
+        return dropdown_has_value(control, option)
+    except Exception:
+        return False
+
+
+def select_attachment_dropdown(page, control, option, toolbar_bottom):
+    """Select an attachment filter and verify its displayed input value."""
+
+    def fresh_control():
+        if option.casefold() == "description":
+            return find_description_filter_input(page)
+        controls = visible_search_inputs(page)
+        return controls[1] if len(controls) > 1 else None
+
+    current_control = fresh_control() or control
+    if dropdown_has_value(current_control, option):
+        log(f"Attachment filter dropdown already selected: {option}.")
+        return
+
+    menu_still_open = False
+    try:
+        click_adjacent_dropdown_arrow(page, current_control, option)
+        menu_still_open = True
+        page.wait_for_timeout(700)
+        if choose_visible_dropdown_option(
+            page, current_control, option, toolbar_bottom
+        ):
+            menu_still_open = False
+            page.wait_for_timeout(700)
+            current_control = fresh_control()
+            if current_control is not None and dropdown_has_value(
+                current_control, option
+            ):
+                log(f"Selected and verified attachment filter: {option}.")
+                return
+            log(
+                f"Clicked the dropdown's {option} option, but Epic did not "
+                "retain it; retrying with dropdown keyboard navigation."
+            )
     except Exception as error:
+        menu_still_open = False
         log(f"Could not use the {option} dropdown arrow: {error}")
 
-    # Close any menu accidentally opened before attempting direct entry.
+    if option.casefold() == "description":
+        try:
+            # If text-location selection failed, its menu is still open. Do not
+            # touch the now-stale old input; select the fifth menu entry directly.
+            if not menu_still_open:
+                current_control = fresh_control()
+                if current_control is None:
+                    raise RuntimeError("Description input disappeared after re-render.")
+                click_adjacent_dropdown_arrow(page, current_control, option)
+                page.wait_for_timeout(500)
+
+            page.keyboard.press("Home")
+            for _ in range(4):
+                page.keyboard.press("ArrowDown")
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(1000)
+
+            current_control = fresh_control()
+            if current_control is not None and dropdown_has_value(
+                current_control, option
+            ):
+                log(
+                    "Selected and verified Description by dropdown "
+                    "keyboard navigation."
+                )
+                return
+        except Exception as error:
+            log(f"Description keyboard dropdown selection failed: {error}")
+
     try:
         page.keyboard.press("Escape")
     except Exception:
         pass
 
-    if type_dropdown_value(page, control, option):
-        log(f"Typed attachment filter dropdown value: {option}.")
+    current_control = fresh_control()
+    if (
+        option.casefold() != "description"
+        and current_control is not None
+        and type_dropdown_value(page, current_control, option)
+    ):
+        log(f"Typed and verified attachment filter: {option}.")
         return
 
     raise RuntimeError(
-        f"Could not select or type {option!r} in the attachment filter."
+        f"Could not commit {option!r} as an actual attachment dropdown option."
     )
 
 
@@ -709,15 +842,49 @@ def apply_policy_attachment_filter(page):
             f"but found {len(controls)}."
         )
 
-    first_box = controls[0].bounding_box()
+    description_control = find_description_filter_input(page)
+    if description_control is None:
+        raise RuntimeError("The exact first Description filter input was not visible.")
+
+    first_box = description_control.bounding_box()
     toolbar_y = first_box["y"] + first_box["height"] if first_box else 0
-    select_attachment_dropdown(page, controls[0], "Description", toolbar_y)
+    select_attachment_dropdown(
+        page, description_control, "Description", toolbar_y
+    )
 
     # Re-query because selecting the first dropdown can re-render the toolbar.
     controls = visible_search_inputs(page)
     select_attachment_dropdown(page, controls[1], "Contains", toolbar_y)
 
+    # Final verification: never run Find while Description is blank. Retry each
+    # field once after all combo re-renders, then require both visible values.
     controls = visible_search_inputs(page)
+    description_control = find_description_filter_input(page)
+    if description_control is None or not dropdown_has_value(
+        description_control, "Description"
+    ):
+        log("First filter became blank; forcing Description again.")
+        description_control = find_description_filter_input(page)
+        if description_control is None:
+            raise RuntimeError("Description filter disappeared after re-render.")
+        select_attachment_dropdown(
+            page, description_control, "Description", toolbar_y
+        )
+
+    controls = visible_search_inputs(page)
+    if not dropdown_has_value(controls[1], "Contains"):
+        log("Second filter became blank; forcing Contains again.")
+        select_attachment_dropdown(page, controls[1], "Contains", toolbar_y)
+
+    controls = visible_search_inputs(page)
+    description_control = find_description_filter_input(page)
+    if description_control is None or not dropdown_has_value(
+        description_control, "Description"
+    ):
+        raise RuntimeError("First attachment filter is still blank, not Description.")
+    if not dropdown_has_value(controls[1], "Contains"):
+        raise RuntimeError("Second attachment filter is still blank, not Contains.")
+
     search_value = controls[2]
     search_value.click(force=True)
     search_value.fill("policy")
