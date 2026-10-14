@@ -273,7 +273,7 @@ def main():
             )
 
         # Read E:P. Indexes relative to E:P:
-        # E=0, H=3, I=4, L=7, M=8.
+        # E=0, H=3, I=4, L=7, N=9.
         rates_data = as_rows(
             rates_ws.Range(
                 rates_ws.Cells(2, 5),
@@ -282,16 +282,17 @@ def main():
         )
 
         p_values = []
-        lookup = {}
+        lookup_b_to_l = {}
+        lookup_f_to_n = {}
         kept_count = 0
         skipped_count = 0
 
         for row in rates_data:
-            status = cell_text(row[0])  # Column E
-            value_h = row[3]            # Column H
-            value_i = row[4]            # Column I
-            value_k = row[7]            # Column L
-            value_l = row[9]            # Column N
+            status = cell_text(row[0])   # Column E
+            value_h = row[3]             # Column H
+            value_i = row[4]             # Column I
+            value_l = row[7]             # Column L
+            value_n = row[9]             # Column N
 
             # Keep only records whose Column E begins with KEYPEO.
             if not status.upper().startswith("KEYPEO"):
@@ -299,15 +300,21 @@ def main():
                 skipped_count += 1
                 continue
 
-            # Concatenate H + I without a separator and write to Column P.
+            # First lookup key: concatenate H + I without a separator and
+            # write it to Column P. Expiring Dump B uses this key to return L.
             key_display = cell_text(value_h) + cell_text(value_i)
             p_values.append((key_display or None,))
             kept_count += 1
 
-            key = make_lookup_key(key_display)
-            # Match XLOOKUP behavior: use the first occurrence of a key.
-            if key and key not in lookup:
-                lookup[key] = (value_k, value_l)
+            key_b = make_lookup_key(key_display)
+            if key_b and key_b not in lookup_b_to_l:
+                lookup_b_to_l[key_b] = value_l
+
+            # Second, independent lookup: Expiring Dump F matches Rates H and
+            # returns Rates N into Expiring Dump K.
+            key_f = make_lookup_key(value_h)
+            if key_f and key_f not in lookup_f_to_n:
+                lookup_f_to_n[key_f] = value_n
 
         log("Writing KEYPEO concatenation keys into Rates Payroll Column P...")
         rates_ws.Range(
@@ -319,19 +326,31 @@ def main():
             rates_ws.Cells(rates_last_row, 16)
         ).Value = tuple(p_values)
 
-        log("Matching Expiring Dump Column B against Rates Payroll Column P...")
-        template_last_row = expiring_ws.Cells(
+        log(
+            "Matching Expiring Dump B -> Rates P (return L), and "
+            "Expiring Dump F -> Rates H (return N)..."
+        )
+        last_row_b = expiring_ws.Cells(
             expiring_ws.Rows.Count, 2
-        ).End(XL_UP).Row  # Column B
+        ).End(XL_UP).Row
+        last_row_f = expiring_ws.Cells(
+            expiring_ws.Rows.Count, 6
+        ).End(XL_UP).Row
+        template_last_row = max(last_row_b, last_row_f)
 
-        match_count = 0
-        missing_count = 0
+        match_count_b = 0
+        missing_count_b = 0
+        match_count_f = 0
+        missing_count_f = 0
 
         if template_last_row >= DEST_START_ROW:
+            # Read B:F so each destination uses its own independent key:
+            # B (index 0) -> Rates P -> Rates L -> destination H
+            # F (index 4) -> Rates H -> Rates N -> destination K
             template_keys = as_rows(
                 expiring_ws.Range(
                     expiring_ws.Cells(DEST_START_ROW, 2),
-                    expiring_ws.Cells(template_last_row, 2)
+                    expiring_ws.Cells(template_last_row, 6)
                 ).Value2
             )
 
@@ -339,17 +358,23 @@ def main():
             output_k = []
 
             for row in template_keys:
-                key = make_lookup_key(row[0])
-                if key and key in lookup:
-                    result_k, result_l = lookup[key]
-                    output_h.append((result_k,))
-                    output_k.append((result_l,))
-                    match_count += 1
+                key_b = make_lookup_key(row[0])
+                if key_b and key_b in lookup_b_to_l:
+                    output_h.append((lookup_b_to_l[key_b],))
+                    match_count_b += 1
                 else:
                     output_h.append((None,))
+                    if key_b:
+                        missing_count_b += 1
+
+                key_f = make_lookup_key(row[4])
+                if key_f and key_f in lookup_f_to_n:
+                    output_k.append((lookup_f_to_n[key_f],))
+                    match_count_f += 1
+                else:
                     output_k.append((None,))
-                    if key:
-                        missing_count += 1
+                    if key_f:
+                        missing_count_f += 1
 
             # Clear old outputs to avoid stale values for unmatched records.
             expiring_ws.Range(
@@ -361,19 +386,19 @@ def main():
                 expiring_ws.Cells(template_last_row, 11)
             ).ClearContents()
 
-            # Rates Payroll L -> Expiring Dump H.
+            # Rates Payroll L -> Expiring Dump H (matched B against P).
             expiring_ws.Range(
                 expiring_ws.Cells(DEST_START_ROW, 8),
                 expiring_ws.Cells(template_last_row, 8)
             ).Value = tuple(output_h)
 
-            # Rates Payroll M -> Expiring Dump K.
+            # Rates Payroll N -> Expiring Dump K (matched F against H).
             expiring_ws.Range(
                 expiring_ws.Cells(DEST_START_ROW, 11),
                 expiring_ws.Cells(template_last_row, 11)
             ).Value = tuple(output_k)
         else:
-            log("No lookup keys found in Expiring Dump Column B from row 3.")
+            log("No lookup keys found in Expiring Dump B or F from row 3.")
 
         # Save both edited workbooks.
         log("Saving Rates Payroll workbook...")
@@ -396,12 +421,21 @@ def main():
         log(f"Rates Payroll rows checked: {len(rates_data)}")
         log(f"Rows kept (Column E begins with KEYPEO): {kept_count}")
         log(f"Rows skipped (Column E does not begin with KEYPEO): {skipped_count}")
-        log(f"Unique nonblank lookup keys: {len(lookup)}")
+        log(
+            "Unique B->P lookup keys (return L): "
+            f"{len(lookup_b_to_l)}"
+        )
+        log(
+            "Unique F->H lookup keys (return N): "
+            f"{len(lookup_f_to_n)}"
+        )
         log(f"Expiring Dump rows checked: {max(0, template_last_row - 2)}")
-        log(f"Lookup matches found: {match_count}")
-        log(f"Nonblank lookup keys with no match: {missing_count}")
-        log("Rates Payroll L -> Expiring Dump H.")
-        log("Rates Payroll N -> Expiring Dump K.")
+        log(f"B->P matches found for destination H: {match_count_b}")
+        log(f"Nonblank B keys with no P match: {missing_count_b}")
+        log(f"F->H matches found for destination K: {match_count_f}")
+        log(f"Nonblank F keys with no H match: {missing_count_f}")
+        log("Expiring B -> Rates P -> Rates L -> Expiring H.")
+        log("Expiring F -> Rates H -> Rates N -> Expiring K.")
         log("SUCCESS: All three transfer/lookup steps completed.")
 
     finally:
