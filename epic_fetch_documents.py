@@ -27,8 +27,7 @@ import time
 
 import epic_config as config
 from epic_login import (
-    click_post_login_confirmation_if_visible,
-    complete_post_login_confirmation,
+    concurrent_login_warning_visible,
     find_logged_in_page,
     save_session_storage,
     save_storage_state,
@@ -170,11 +169,19 @@ def authenticate_in_current_context(context, page):
 
     deadline = time.time() + config.LOGIN_TIMEOUT_SECONDS
     authenticated_page = None
+    takeover_warning_announced = False
     while time.time() < deadline:
-        # Epic may show its Yes confirmation before Locate is detectable.
+        # A Yes button here means this account is active on another device.
+        # Bring it forward but leave the takeover decision to the user.
         for candidate_page in list(context.pages):
-            if click_post_login_confirmation_if_visible(candidate_page):
-                candidate_page.wait_for_timeout(3000)
+            if concurrent_login_warning_visible(candidate_page):
+                candidate_page.bring_to_front()
+                if not takeover_warning_announced:
+                    log(
+                        "Epic reports this account is active elsewhere. "
+                        "Choose Yes or No manually in the browser."
+                    )
+                    takeover_warning_announced = True
         authenticated_page = find_logged_in_page(context)
         if authenticated_page is not None:
             break
@@ -188,9 +195,8 @@ def authenticate_in_current_context(context, page):
         )
 
     authenticated_page.bring_to_front()
-    complete_post_login_confirmation(authenticated_page)
     authenticated_page.wait_for_timeout(3000)
-    log("Confirmed authenticated and unlocked Epic home screen.")
+    log("Confirmed authenticated home screen with no takeover decision pending.")
 
     # Keep backups for diagnostics/future reuse attempts. The extraction below
     # does not close or replace this authenticated browser process.
@@ -763,7 +769,6 @@ def main():
 
         if session_is_valid(page):
             log("Reused authenticated home screen from saved browser state.")
-            complete_post_login_confirmation(page, timeout_seconds=5)
         else:
             # Applied Epic/Okta rejected the reconstructed state. Authenticate
             # and continue extraction without ending this browser process.

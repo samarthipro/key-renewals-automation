@@ -92,50 +92,32 @@ def try_fill_login(page):
             continue
 
 
+def concurrent_login_warning_visible(page):
+    """Return True when Epic asks whether to take over another login."""
+    try:
+        yes_buttons = page.get_by_role("button", name="Yes", exact=True)
+        return any(
+            yes_buttons.nth(index).is_visible(timeout=300)
+            for index in range(yes_buttons.count())
+        )
+    except Exception:
+        return False
+
+
 def find_logged_in_page(context):
-    """Return the page containing Epic's Locate toolbar, or None."""
+    """Return an unlocked page containing Epic's Locate toolbar, or None."""
     for page in list(context.pages):
         try:
+            # A visible Yes means another-device takeover is awaiting the
+            # user's decision. Do not automate that decision or start work yet.
+            if concurrent_login_warning_visible(page):
+                continue
             locate = page.get_by_title("Locate (F2)").locator("i")
             if locate.is_visible(timeout=800):
                 return page
         except Exception:
             continue
     return None
-
-
-def click_post_login_confirmation_if_visible(page):
-    """Click one visible post-login Yes confirmation, if present."""
-    try:
-        yes_buttons = page.get_by_role("button", name="Yes", exact=True)
-        for index in range(yes_buttons.count()):
-            button = yes_buttons.nth(index)
-            if button.is_visible(timeout=300):
-                button.click(timeout=10000, force=True)
-                log("Accepted Epic's post-login Yes confirmation.")
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def complete_post_login_confirmation(page, timeout_seconds=20):
-    """
-    Accept Epic's post-OIDC confirmation that unlocks the Home toolbar.
-
-    The original recorded flow clicked a role=button named 'Yes' immediately
-    after the Okta callback and before Locate. Epic can render Home underneath
-    this confirmation layer, making the toolbar visible but non-interactive.
-    """
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        if click_post_login_confirmation_if_visible(page):
-            page.wait_for_timeout(5000)
-            return True
-        page.wait_for_timeout(500)
-
-    log("No visible post-login Yes confirmation was detected.")
-    return False
 
 
 def save_session_storage(context):
@@ -227,11 +209,19 @@ def main():
             print("=" * 70 + "\n")
 
             deadline = time.time() + config.LOGIN_TIMEOUT_SECONDS
+            takeover_warning_announced = False
             while time.time() < deadline:
-                # The Yes confirmation can appear before Epic exposes Locate.
+                # If this account is active elsewhere, Epic asks the user
+                # whether to take over. Leave that decision to the user.
                 for candidate_page in list(context.pages):
-                    if click_post_login_confirmation_if_visible(candidate_page):
-                        candidate_page.wait_for_timeout(3000)
+                    if concurrent_login_warning_visible(candidate_page):
+                        candidate_page.bring_to_front()
+                        if not takeover_warning_announced:
+                            log(
+                                "Epic reports this account is active elsewhere. "
+                                "Choose Yes or No manually in the browser."
+                            )
+                            takeover_warning_announced = True
                 logged_in_page = find_logged_in_page(context)
                 if logged_in_page is not None:
                     break
@@ -243,9 +233,8 @@ def main():
             context.close()
             sys.exit(1)
 
-        log("Confirmed: logged in (Locate toolbar is visible).")
+        log("Confirmed: logged in and no takeover decision is pending.")
         logged_in_page.bring_to_front()
-        complete_post_login_confirmation(logged_in_page)
         logged_in_page.wait_for_timeout(3000)
 
         save_session_storage(context)

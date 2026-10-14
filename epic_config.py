@@ -74,6 +74,10 @@ ATTACHMENT_NAME = os.getenv("ATTACHMENT_NAME", "")
 # only if Chrome is unavailable and Playwright's bundled Chromium is required.
 BROWSER_CHANNEL = os.getenv("EPIC_BROWSER_CHANNEL", "chrome").strip() or None
 
+# External normal-Chrome/CDP worker configuration.
+CDP_PORT = int(os.getenv("EPIC_CDP_PORT", "9222"))
+CHROME_PATH = os.getenv("EPIC_CHROME_PATH", "").strip()
+
 # Fallback page coordinates for Epic's blue-toolbar Locate control. These are
 # Playwright viewport coordinates (not Windows screen coordinates) and can be
 # adjusted locally if the toolbar layout differs.
