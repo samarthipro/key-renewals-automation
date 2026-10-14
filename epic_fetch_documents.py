@@ -611,27 +611,42 @@ def visible_search_inputs(page):
     return [candidate for _, candidate in controls]
 
 
-def choose_visible_dropdown_option(page, option, toolbar_bottom):
-    """Click a dropdown option, never the similarly named grid header."""
+def choose_visible_dropdown_option(page, control, option, toolbar_bottom):
+    """Click an option only inside the dropdown aligned with its input."""
+    control_box = control.bounding_box()
+    if control_box is None:
+        return False
+
     matches = page.get_by_text(option, exact=True)
     candidates = []
+    minimum_x = control_box["x"] - 20
+    maximum_x = control_box["x"] + control_box["width"] + 100
+
     for index in range(matches.count()):
         candidate = matches.nth(index)
         try:
             if not candidate.is_visible(timeout=200):
                 continue
             box = candidate.bounding_box()
-            # The grid header is immediately below the search toolbar. Actual
-            # dropdown options are rendered farther down in the open menu.
-            if box and box["y"] > toolbar_bottom + 35:
+            if not box:
+                continue
+
+            # Reject the grid's Description column header. The actual option is
+            # rendered below the toolbar and horizontally aligned with the
+            # first combo input/dropdown popup.
+            if (
+                box["y"] > toolbar_bottom + 35
+                and minimum_x <= box["x"] <= maximum_x
+            ):
                 candidates.append((box["y"], candidate))
         except Exception:
             continue
+
     if not candidates:
         return False
 
     _, selected = min(candidates, key=lambda item: item[0])
-    mouse_click_locator(page, selected, f"dropdown option {option}")
+    mouse_click_locator(page, selected, f"actual {option} dropdown option")
     return True
 
 
@@ -706,41 +721,60 @@ def select_attachment_dropdown(page, control, option, toolbar_bottom):
         log(f"Attachment filter dropdown already selected: {option}.")
         return
 
-    # Description is known to be an editable first combo. Type it first so the
-    # script does not accidentally choose the Description grid header.
-    if option.casefold() == "description" and type_dropdown_value(
-        page, control, option
-    ):
-        log("Typed and verified first attachment filter: Description.")
-        return
-
-    # Click the separate arrow highlighted in the screenshot.
+    # Click the separate arrow highlighted in the screenshot. The option click
+    # is constrained to this dropdown's horizontal popup area, so it cannot
+    # select the Description table header.
     try:
         click_adjacent_dropdown_arrow(page, control, option)
         page.wait_for_timeout(700)
-        if choose_visible_dropdown_option(page, option, toolbar_bottom):
+        if choose_visible_dropdown_option(
+            page, control, option, toolbar_bottom
+        ):
             page.wait_for_timeout(700)
             if dropdown_has_value(control, option):
                 log(f"Selected and verified attachment filter: {option}.")
                 return
             log(
-                f"Clicked a {option} text match, but the dropdown did not "
-                "display that value; retrying by direct entry."
+                f"Clicked the dropdown's {option} option, but the input did "
+                "not retain it; trying keyboard selection."
             )
     except Exception as error:
         log(f"Could not use the {option} dropdown arrow: {error}")
+
+    # Deterministic fallback for the first menu shown in the screenshot:
+    # Name, Attached By, Attached Date, Comments, Description.
+    if option.casefold() == "description":
+        try:
+            page.keyboard.press("Escape")
+            click_adjacent_dropdown_arrow(page, control, option)
+            page.wait_for_timeout(500)
+            page.keyboard.press("Home")
+            for _ in range(4):
+                page.keyboard.press("ArrowDown")
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(700)
+            if dropdown_has_value(control, option):
+                log("Selected and verified Description by dropdown keyboard navigation.")
+                return
+        except Exception as error:
+            log(f"Description keyboard dropdown selection failed: {error}")
 
     try:
         page.keyboard.press("Escape")
     except Exception:
         pass
 
-    if type_dropdown_value(page, control, option):
+    # Direct entry remains useful for Contains, whose combo accepts typed text.
+    # Do not report Description as selected merely because display text was
+    # injected; Description must be committed as an actual dropdown option.
+    if option.casefold() != "description" and type_dropdown_value(
+        page, control, option
+    ):
         log(f"Typed and verified attachment filter: {option}.")
         return
 
     raise RuntimeError(
-        f"Could not make the attachment filter display {option!r}."
+        f"Could not commit {option!r} as an actual attachment dropdown option."
     )
 
 
