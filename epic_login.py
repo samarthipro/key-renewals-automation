@@ -104,6 +104,40 @@ def find_logged_in_page(context):
     return None
 
 
+def click_post_login_confirmation_if_visible(page):
+    """Click one visible post-login Yes confirmation, if present."""
+    try:
+        yes_buttons = page.get_by_role("button", name="Yes", exact=True)
+        for index in range(yes_buttons.count()):
+            button = yes_buttons.nth(index)
+            if button.is_visible(timeout=300):
+                button.click(timeout=10000, force=True)
+                log("Accepted Epic's post-login Yes confirmation.")
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def complete_post_login_confirmation(page, timeout_seconds=20):
+    """
+    Accept Epic's post-OIDC confirmation that unlocks the Home toolbar.
+
+    The original recorded flow clicked a role=button named 'Yes' immediately
+    after the Okta callback and before Locate. Epic can render Home underneath
+    this confirmation layer, making the toolbar visible but non-interactive.
+    """
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if click_post_login_confirmation_if_visible(page):
+            page.wait_for_timeout(5000)
+            return True
+        page.wait_for_timeout(500)
+
+    log("No visible post-login Yes confirmation was detected.")
+    return False
+
+
 def save_session_storage(context):
     """Save sessionStorage for every currently open HTTP(S) origin."""
     saved = {}
@@ -154,6 +188,9 @@ def main():
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=str(config.PROFILE_DIR),
             headless=False,
+            channel=config.BROWSER_CHANNEL,
+            args=["--start-maximized"],
+            no_viewport=True,
             accept_downloads=True,
         )
 
@@ -191,6 +228,10 @@ def main():
 
             deadline = time.time() + config.LOGIN_TIMEOUT_SECONDS
             while time.time() < deadline:
+                # The Yes confirmation can appear before Epic exposes Locate.
+                for candidate_page in list(context.pages):
+                    if click_post_login_confirmation_if_visible(candidate_page):
+                        candidate_page.wait_for_timeout(3000)
                 logged_in_page = find_logged_in_page(context)
                 if logged_in_page is not None:
                     break
@@ -204,7 +245,8 @@ def main():
 
         log("Confirmed: logged in (Locate toolbar is visible).")
         logged_in_page.bring_to_front()
-        logged_in_page.wait_for_timeout(5000)
+        complete_post_login_confirmation(logged_in_page)
+        logged_in_page.wait_for_timeout(3000)
 
         save_session_storage(context)
         save_storage_state(context)

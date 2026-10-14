@@ -70,6 +70,10 @@ POLICY_CODE = os.getenv("POLICY_CODE", "KEYPEO00688800")
 # Leave blank to download EVERY attachment listed for the policy.
 ATTACHMENT_NAME = os.getenv("ATTACHMENT_NAME", "")
 
+# Use installed Google Chrome for Applied Epic compatibility. Set this blank
+# only if Chrome is unavailable and Playwright's bundled Chromium is required.
+BROWSER_CHANNEL = os.getenv("EPIC_BROWSER_CHANNEL", "chrome").strip() or None
+
 # Fallback page coordinates for Epic's blue-toolbar Locate control. These are
 # Playwright viewport coordinates (not Windows screen coordinates) and can be
 # adjusted locally if the toolbar layout differs.

@@ -27,6 +27,8 @@ import time
 
 import epic_config as config
 from epic_login import (
+    click_post_login_confirmation_if_visible,
+    complete_post_login_confirmation,
     find_logged_in_page,
     save_session_storage,
     save_storage_state,
@@ -169,6 +171,10 @@ def authenticate_in_current_context(context, page):
     deadline = time.time() + config.LOGIN_TIMEOUT_SECONDS
     authenticated_page = None
     while time.time() < deadline:
+        # Epic may show its Yes confirmation before Locate is detectable.
+        for candidate_page in list(context.pages):
+            if click_post_login_confirmation_if_visible(candidate_page):
+                candidate_page.wait_for_timeout(3000)
         authenticated_page = find_logged_in_page(context)
         if authenticated_page is not None:
             break
@@ -182,8 +188,9 @@ def authenticate_in_current_context(context, page):
         )
 
     authenticated_page.bring_to_front()
+    complete_post_login_confirmation(authenticated_page)
     authenticated_page.wait_for_timeout(3000)
-    log("Confirmed authenticated home screen in the live browser session.")
+    log("Confirmed authenticated and unlocked Epic home screen.")
 
     # Keep backups for diagnostics/future reuse attempts. The extraction below
     # does not close or replace this authenticated browser process.
@@ -737,6 +744,9 @@ def main():
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=str(config.PROFILE_DIR),
             headless=False,  # visible because interactive Okta may be required
+            channel=config.BROWSER_CHANNEL,
+            args=["--start-maximized"],
+            no_viewport=True,
             accept_downloads=True,
         )
 
@@ -753,6 +763,7 @@ def main():
 
         if session_is_valid(page):
             log("Reused authenticated home screen from saved browser state.")
+            complete_post_login_confirmation(page, timeout_seconds=5)
         else:
             # Applied Epic/Okta rejected the reconstructed state. Authenticate
             # and continue extraction without ending this browser process.
