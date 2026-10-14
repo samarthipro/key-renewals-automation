@@ -571,6 +571,173 @@ def open_policy_attachments(page, policy_code):
     page.wait_for_timeout(3000)
 
 
+def visible_search_inputs(page):
+    """Find and left-to-right sort inputs on the Attachments search row."""
+    labels = page.get_by_text("Search where", exact=True)
+    label_box = None
+    for index in range(labels.count()):
+        try:
+            label = labels.nth(index)
+            if label.is_visible(timeout=300):
+                label_box = label.bounding_box()
+                if label_box:
+                    break
+        except Exception:
+            continue
+    if label_box is None:
+        raise RuntimeError("The Attachments 'Search where' toolbar was not visible.")
+
+    label_center_y = label_box["y"] + label_box["height"] / 2
+    controls = []
+    inputs = page.locator("input")
+    for index in range(inputs.count()):
+        candidate = inputs.nth(index)
+        try:
+            if not candidate.is_visible(timeout=200):
+                continue
+            box = candidate.bounding_box()
+            if not box:
+                continue
+            center_y = box["y"] + box["height"] / 2
+            if (
+                abs(center_y - label_center_y) <= 25
+                and box["x"] > label_box["x"]
+            ):
+                controls.append((box["x"], candidate))
+        except Exception:
+            continue
+
+    controls.sort(key=lambda item: item[0])
+    return [candidate for _, candidate in controls]
+
+
+def choose_visible_dropdown_option(page, option, toolbar_bottom):
+    """Click a dropdown option, never the similarly named grid header."""
+    matches = page.get_by_text(option, exact=True)
+    candidates = []
+    for index in range(matches.count()):
+        candidate = matches.nth(index)
+        try:
+            if not candidate.is_visible(timeout=200):
+                continue
+            box = candidate.bounding_box()
+            # The grid header is immediately below the search toolbar. Actual
+            # dropdown options are rendered farther down in the open menu.
+            if box and box["y"] > toolbar_bottom + 35:
+                candidates.append((box["y"], candidate))
+        except Exception:
+            continue
+    if not candidates:
+        return False
+
+    _, selected = min(candidates, key=lambda item: item[0])
+    mouse_click_locator(page, selected, f"dropdown option {option}")
+    return True
+
+
+def click_adjacent_dropdown_arrow(page, control, description):
+    """Click the separate arrow immediately right of an Epic combo input."""
+    box = control.bounding_box()
+    if box is None:
+        raise RuntimeError(f"{description} input has no bounding box.")
+
+    # The screenshot shows a ~20px arrow button directly beside the input.
+    x = box["x"] + box["width"] + 10
+    y = box["y"] + box["height"] / 2
+    log(f"Mouse-clicking {description} arrow at ({x:.0f}, {y:.0f}).")
+    page.mouse.move(x, y)
+    page.wait_for_timeout(200)
+    page.mouse.down()
+    page.wait_for_timeout(100)
+    page.mouse.up()
+
+
+def type_dropdown_value(page, control, option):
+    """Fallback: type an option directly into the combo input."""
+    try:
+        control.click(force=True)
+        control.fill(option)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(500)
+        current = control.input_value(timeout=1000).strip()
+        return current.casefold() == option.casefold()
+    except Exception:
+        return False
+
+
+def select_attachment_dropdown(page, control, option, toolbar_bottom):
+    """Select an attachment filter through its separate arrow or direct input."""
+    try:
+        current = control.input_value(timeout=1000).strip()
+        if current.casefold() == option.casefold():
+            log(f"Attachment filter dropdown already selected: {option}.")
+            return
+    except Exception:
+        pass
+
+    # Primary path: click the separate arrow highlighted in the screenshot.
+    try:
+        click_adjacent_dropdown_arrow(page, control, option)
+        page.wait_for_timeout(700)
+        if choose_visible_dropdown_option(page, option, toolbar_bottom):
+            log(f"Selected attachment filter dropdown: {option}.")
+            return
+    except Exception as error:
+        log(f"Could not use the {option} dropdown arrow: {error}")
+
+    # Close any menu accidentally opened before attempting direct entry.
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+    if type_dropdown_value(page, control, option):
+        log(f"Typed attachment filter dropdown value: {option}.")
+        return
+
+    raise RuntimeError(
+        f"Could not select or type {option!r} in the attachment filter."
+    )
+
+
+def apply_policy_attachment_filter(page):
+    """Set Description / Contains / policy and click Find."""
+    controls = visible_search_inputs(page)
+    if len(controls) < 3:
+        raise RuntimeError(
+            "Expected three inputs on the Attachments search row "
+            f"but found {len(controls)}."
+        )
+
+    first_box = controls[0].bounding_box()
+    toolbar_y = first_box["y"] + first_box["height"] if first_box else 0
+    select_attachment_dropdown(page, controls[0], "Description", toolbar_y)
+
+    # Re-query because selecting the first dropdown can re-render the toolbar.
+    controls = visible_search_inputs(page)
+    select_attachment_dropdown(page, controls[1], "Contains", toolbar_y)
+
+    controls = visible_search_inputs(page)
+    search_value = controls[2]
+    search_value.click(force=True)
+    search_value.fill("policy")
+    log("Entered 'policy' in the attachment filter.")
+
+    find_controls = page.get_by_text("Find", exact=True)
+    if not mouse_click_first_visible(page, find_controls, "Attachments Find"):
+        # Accessible-role fallback for implementations where the label is nested.
+        find_buttons = page.get_by_role("button", name="Find", exact=True)
+        if not mouse_click_first_visible(page, find_buttons, "Attachments Find button"):
+            search_value.press("Enter")
+            log("Find control was not detected; submitted with Enter.")
+        else:
+            log("Clicked Find in the attachment filter.")
+    else:
+        log("Clicked Find in the attachment filter.")
+
+    page.wait_for_timeout(3000)
+
+
 def find_visible_exact_text(page, text):
     """Return the smallest visible exact-text match for a document name."""
     matches = page.get_by_text(text, exact=True)
@@ -642,9 +809,11 @@ def policy_document_names(page):
 
 
 def download_attachments(page, target_name=""):
-    """Download a named document or every visible name ending in 'Policy'."""
+    """Filter attachments, then download a named or Policy-ending document."""
     downloaded = []
     target_name = target_name.strip()
+
+    apply_policy_attachment_filter(page)
     names = [target_name] if target_name else policy_document_names(page)
 
     if target_name:
