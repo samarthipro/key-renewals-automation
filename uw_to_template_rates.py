@@ -202,7 +202,7 @@ def copy_quote_block_and_refresh_pivot(quote_wb, template_wb):
         )
 
     log(
-        f"Copied {source_ws.Name}!B2:{source_ws.Cells(last_row, last_col).Address(False, False)} "
+        f"Copied {source_ws.Name}!B2:{source_ws.Cells(last_row, last_col).Address} "
         f"to {QUOTE_MASTER_SHEET}!J2 "
         f"({row_count} rows x {column_count} columns)."
     )
