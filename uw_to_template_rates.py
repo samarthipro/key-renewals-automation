@@ -227,6 +227,51 @@ def copy_quote_block_and_refresh_pivot(quote_wb, template_wb):
     return row_count, column_count, pivot_count
 
 
+def fill_expiring_lookup_key_formulas(ws):
+    """Fill B with F&G through the last active row in Column D."""
+    previous_last_b = ws.Cells(ws.Rows.Count, 2).End(XL_UP).Row
+    current_last_d = ws.Cells(ws.Rows.Count, 4).End(XL_UP).Row
+
+    if current_last_d < DEST_START_ROW:
+        if previous_last_b >= DEST_START_ROW:
+            ws.Range(
+                ws.Cells(DEST_START_ROW, 2),
+                ws.Cells(previous_last_b, 2),
+            ).ClearContents()
+        log("No Expiring Dump Column D records found; Column B was not filled.")
+        return current_last_d
+
+    # Seed B3 with State F + Class Code G, then drag/fill the relative formula
+    # down through the final record identified by Column D.
+    ws.Cells(DEST_START_ROW, 2).Formula = (
+        f"=F{DEST_START_ROW}&G{DEST_START_ROW}"
+    )
+    formula_range = ws.Range(
+        ws.Cells(DEST_START_ROW, 2),
+        ws.Cells(current_last_d, 2),
+    )
+    if current_last_d > DEST_START_ROW:
+        formula_range.FillDown()
+
+    # Calculation is manual during this script, so calculate these lookup keys
+    # now before the Rates Payroll matching step reads Column B values.
+    formula_range.Calculate()
+
+    # Remove formulas left from a previous longer run, without touching the
+    # current B3:last-D formula range.
+    if previous_last_b > current_last_d:
+        ws.Range(
+            ws.Cells(current_last_d + 1, 2),
+            ws.Cells(previous_last_b, 2),
+        ).ClearContents()
+
+    log(
+        f"Filled Expiring Dump lookup formulas "
+        f"B{DEST_START_ROW}:B{current_last_d} using F&G."
+    )
+    return current_last_d
+
+
 def main():
     for path, label in (
         (SOURCE_FILE, "UW workbook"),
@@ -377,6 +422,10 @@ def main():
         expiring_ws.Range(
             f"D{DEST_START_ROW}:G{last_data_row}"
         ).Value = expiring_records
+
+        # Build the Expiring Dump lookup key before Rates Payroll matching.
+        # Example: if Column D ends at row 50, fill B3:B50 with =Frow&Grow.
+        fill_expiring_lookup_key_formulas(expiring_ws)
 
         # STEP 3: Prepare Rates Payroll Column P and look up into Expiring Dump.
         log("Opening Rates Payroll workbook...")

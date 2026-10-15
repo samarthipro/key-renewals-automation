@@ -25,7 +25,7 @@ The script finds the following fields by header name:
 - Payroll
 These records are written to columns C:H, starting at row 3, in the template workbook's Master Comparision worksheet.
 2. Expiring Dump transfer
-Columns D:G from Master Comparision are copied to Expiring Dump (KeyRisk), starting at D3.
+Columns D:G from Master Comparision are copied to Expiring Dump (KeyRisk), starting at D3. Immediately afterward, Stage 1 writes `=F3&G3` into B3 and fills the relative formula down through the last nonblank row in Column D (for example, B3:B50 when D50 is the final record). The filled B range is calculated before Rates Payroll matching, and stale B formulas below the current last-D row are cleared.
 3. Rates Payroll preparation
 Source: Rates Payroll.xlsx, worksheet Lotus Merged Payroll.
 - Keep rows where Column E begins with KEYPEO.
