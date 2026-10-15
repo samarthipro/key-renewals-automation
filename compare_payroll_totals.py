@@ -16,8 +16,8 @@ Quote workbook:
 - Class Code: Column H.
 - Payroll: Column J.
 
-If the totals match to the cent, the script prints MATCH and does not modify a
-workbook. If they differ, it creates/replaces a "Payroll Comparison" sheet in
+If the totals match after standard whole-dollar rounding, the script prints MATCH
+and does not modify a workbook. If they differ, it creates/replaces a "Payroll Comparison" sheet in
 the Quote workbook showing payroll differences by State and Class Code. A
 backup of the Quote workbook is created before that workbook is modified.
 
@@ -48,7 +48,7 @@ UW_SHEET = "Master"
 REPORT_SHEET = "Payroll Comparison"
 
 DATA_START_ROW = 2
-CENT = Decimal("0.01")
+WHOLE_DOLLAR = Decimal("1")
 
 XL_UP = -4162
 XL_TO_LEFT = -4159
@@ -126,8 +126,8 @@ def parse_amount(value, workbook_label, excel_row):
 
 
 def money(value):
-    """Round a payroll total to cents using standard half-up rounding."""
-    return value.quantize(CENT, rounding=ROUND_HALF_UP)
+    """Round a payroll total to the nearest whole dollar, half up."""
+    return value.quantize(WHOLE_DOLLAR, rounding=ROUND_HALF_UP)
 
 
 def last_used_row(ws, columns):
@@ -266,7 +266,7 @@ def difference_rows(uw_grouped, quote_grouped):
         uw_payroll = money(uw_grouped.get((state, class_code), Decimal("0")))
         quote_payroll = money(quote_grouped.get((state, class_code), Decimal("0")))
         difference = money(uw_payroll - quote_payroll)
-        if difference == Decimal("0.00"):
+        if difference == Decimal("0"):
             continue
         rows.append(
             (
@@ -298,11 +298,11 @@ def write_report(workbook, uw_total, quote_total, rows):
     report.Range("A1").Font.Bold = True
     report.Range("A1").Font.Size = 14
 
-    report.Range("A3").Value = "UW Total (Master!R)"
+    report.Range("A3").Value = "Rounded UW Total (Master!R)"
     report.Range("B3").Value = float(uw_total)
-    report.Range("A4").Value = "Quote Total (F contains Classcode; sum J)"
+    report.Range("A4").Value = "Rounded Quote Total (F contains Classcode; sum J)"
     report.Range("B4").Value = float(quote_total)
-    report.Range("A5").Value = "Difference (UW - Quote)"
+    report.Range("A5").Value = "Rounded Difference (UW - Quote)"
     report.Range("B5").Value = float(money(uw_total - quote_total))
     report.Range("A6").Value = "Generated"
     report.Range("B6").Value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -310,9 +310,9 @@ def write_report(workbook, uw_total, quote_total, rows):
     headers = (
         "State",
         "Class Code",
-        "UW Payroll",
-        "Quote Payroll",
-        "Difference (UW - Quote)",
+        "Rounded UW Payroll",
+        "Rounded Quote Payroll",
+        "Rounded Difference (UW - Quote)",
         "Status",
     )
     report.Range("A8:F8").Value = (headers,)
@@ -321,13 +321,13 @@ def write_report(workbook, uw_total, quote_total, rows):
     if rows:
         last_report_row = 8 + len(rows)
         report.Range(f"A9:F{last_report_row}").Value = tuple(rows)
-        report.Range(f"C9:E{last_report_row}").NumberFormat = "$#,##0.00;[Red]-$#,##0.00"
+        report.Range(f"C9:E{last_report_row}").NumberFormat = "$#,##0;[Red]-$#,##0"
         report.Range(f"A8:F{last_report_row}").Borders.LineStyle = 1
         report.Range(f"A8:F{last_report_row}").AutoFilter()
     else:
         report.Range("A9").Value = "Totals differ, but no grouped difference was found."
 
-    report.Range("B3:B5").NumberFormat = "$#,##0.00;[Red]-$#,##0.00"
+    report.Range("B3:B5").NumberFormat = "$#,##0;[Red]-$#,##0"
     report.Columns("A:F").AutoFit()
     report.Activate()
     report.Range("A9").Select()
@@ -369,16 +369,16 @@ def main():
 
         log(f"UW rows checked (through last Column A record): {uw_count}")
         log(f"Quote rows included (Column F contains Classcode): {quote_count}")
-        log(f"UW Column R total: {uw_total:,.2f}")
-        log(f"Filtered Quote Column J total: {quote_total:,.2f}")
+        log(f"UW Column R total (rounded): {uw_total:,.0f}")
+        log(f"Filtered Quote Column J total (rounded): {quote_total:,.0f}")
 
         if uw_total == quote_total:
-            log("MATCH: UW and filtered Quote payroll totals are equal.")
+            log("MATCH: Rounded UW and Quote payroll totals are equal.")
             return
 
         total_difference = money(uw_total - quote_total)
         rows = difference_rows(uw_grouped, quote_grouped)
-        log(f"MISMATCH: UW - Quote payroll difference: {total_difference:,.2f}")
+        log(f"MISMATCH: Rounded UW - Quote payroll difference: {total_difference:,.0f}")
         log(f"State/Class combinations with differences: {len(rows)}")
 
         backup = QUOTE_FILE.with_name(
