@@ -2,7 +2,6 @@ from pathlib import Path
 from datetime import datetime
 import shutil
 import sys
-import time
 
 try:
     import win32com.client as win32
@@ -41,22 +40,12 @@ HEADERS = [
 DEST_HEADER_ROW = 2
 DEST_START_ROW = 3
 DEST_START_COL = 3
-QUOTE_SOURCE_START_ROW = 2
-QUOTE_SOURCE_START_COL = 2  # B
-QUOTE_DEST_START_ROW = 2
-QUOTE_DEST_START_COL = 10   # J
 EXISTING_FORMULA_ROW = 83
 
 XL_UP = -4162
 XL_TO_LEFT = -4159
 XL_SHIFT_DOWN = -4121
 XL_CALCULATION_MANUAL = -4135
-XL_CALCULATION_AUTOMATIC = -4105
-XL_FORMULAS = -4123
-XL_PART = 2
-XL_BY_ROWS = 1
-XL_BY_COLUMNS = 2
-XL_PREVIOUS = 2
 
 
 def log(message):
@@ -96,6 +85,16 @@ def as_rows(value):
     return list(value)
 
 
+def count_nonblank_values(value):
+    """Count nonblank cells in a scalar or two-dimensional COM value."""
+    return sum(
+        1
+        for row in as_rows(value)
+        for cell in row
+        if cell not in (None, "")
+    )
+
+
 def find_header_columns(ws, headers, header_row=1):
     last_col = ws.Cells(header_row, ws.Columns.Count).End(XL_TO_LEFT).Column
     found = {}
@@ -128,250 +127,149 @@ def count_blank_cells(ws, column, start_row, last_row):
 
 
 def find_quote_source_sheet(workbook):
-    """Select the Quote sheet containing the most Classcode records in F."""
-    best_sheet = None
-    best_count = -1
-
+    """Choose the Quote sheet with the most Classcode rows in Column F."""
+    selected = None
+    highest_count = -1
     for index in range(1, workbook.Worksheets.Count + 1):
         sheet = workbook.Worksheets(index)
-        if sheet.Name.casefold() == "payroll comparison":
+        last_row = sheet.Cells(sheet.Rows.Count, 6).End(XL_UP).Row
+        if last_row < 2:
             continue
-        try:
-            last_row, last_col = quote_data_bounds(sheet)
-        except ValueError:
-            continue
+        values = as_rows(sheet.Range(sheet.Cells(2, 6), sheet.Cells(last_row, 6)).Value2)
+        classcode_count = sum(
+            1 for row in values if "classcode" in normalize(row[0])
+        )
+        if classcode_count > highest_count:
+            selected = sheet
+            highest_count = classcode_count
 
-        qualifying = 0
-        if last_col >= 6:
-            values = as_rows(
-                sheet.Range(
-                    sheet.Cells(QUOTE_SOURCE_START_ROW, 6),
-                    sheet.Cells(last_row, 6),
-                ).Value2
-            )
-            qualifying = sum(
-                1
-                for row in values
-                if "classcode" in normalize(row[0])
-            )
-
-        if qualifying > best_count:
-            best_sheet = sheet
-            best_count = qualifying
-
-    if best_sheet is None:
+    if selected is None:
         raise ValueError("No populated worksheet was found in the Quote workbook.")
+    log(f"Using Quote source sheet: {selected.Name}")
+    return selected
 
+
+def copy_quote_block_and_refresh_pivot(quote_wb, template_wb):
+    """Copy the contiguous Quote block from B2 to J2 and refresh pivots."""
+    source_ws = find_quote_source_sheet(quote_wb)
+    anchor = source_ws.Cells(2, 2)  # B2
+    if anchor.Value in (None, ""):
+        raise ValueError(f"Quote source cell {source_ws.Name}!B2 is blank.")
+
+    source_region = anchor.CurrentRegion
+    last_row = source_region.Row + source_region.Rows.Count - 1
+    last_col = source_region.Column + source_region.Columns.Count - 1
+    if last_row < 2 or last_col < 2:
+        raise ValueError("No Quote data block was found beginning at B2.")
+
+    source_range = source_ws.Range(
+        source_ws.Cells(2, 2),
+        source_ws.Cells(last_row, last_col),
+    )
+    row_count = source_range.Rows.Count
+    column_count = source_range.Columns.Count
+
+    try:
+        master_ws = template_wb.Worksheets(QUOTE_MASTER_SHEET)
+        pivot_ws = template_wb.Worksheets(QUOTE_PIVOT_SHEET)
+    except Exception as exc:
+        raise ValueError(
+            f"Required template sheet missing: {QUOTE_MASTER_SHEET} "
+            f"or {QUOTE_PIVOT_SHEET}"
+        ) from exc
+
+    target_range = master_ws.Range(
+        master_ws.Cells(2, 10),  # J2
+        master_ws.Cells(2 + row_count - 1, 10 + column_count - 1),
+    )
+    source_values = source_range.Value
+    target_range.Value = source_values
+
+    # Excel COM may convert equivalent values between types (for example,
+    # empty string to None or date representations), so direct tuple equality
+    # is too strict. Verify that the same number of populated cells arrived.
+    source_nonblank = count_nonblank_values(source_values)
+    target_nonblank = count_nonblank_values(target_range.Value)
     log(
-        f"Using Quote source sheet {best_sheet.Name!r} "
-        f"({best_count} Classcode rows in Column F)."
+        f"Quote copy validation: source nonblank={source_nonblank}, "
+        f"destination nonblank={target_nonblank}"
     )
-    return best_sheet
-
-
-def quote_data_bounds(ws):
-    """Return B2:last actual value/formula bounds, ignoring formatting."""
-    last_row_cell = ws.Cells.Find(
-        What="*",
-        After=ws.Cells(1, 1),
-        LookIn=XL_FORMULAS,
-        LookAt=XL_PART,
-        SearchOrder=XL_BY_ROWS,
-        SearchDirection=XL_PREVIOUS,
-        MatchCase=False,
-    )
-    last_col_cell = ws.Cells.Find(
-        What="*",
-        After=ws.Cells(1, 1),
-        LookIn=XL_FORMULAS,
-        LookAt=XL_PART,
-        SearchOrder=XL_BY_COLUMNS,
-        SearchDirection=XL_PREVIOUS,
-        MatchCase=False,
-    )
-    if last_row_cell is None or last_col_cell is None:
-        raise ValueError(f"Quote sheet {ws.Name!r} is empty.")
-
-    last_row = last_row_cell.Row
-    last_col = last_col_cell.Column
-    if last_row < QUOTE_SOURCE_START_ROW or last_col < QUOTE_SOURCE_START_COL:
-        raise ValueError(
-            f"Quote sheet {ws.Name!r} has no data block beginning at B2."
-        )
-    return last_row, last_col
-
-
-def clear_previous_quote_data(ws):
-    """Clear the prior contiguous data block whose top-left cell is J2."""
-    start = ws.Cells(QUOTE_DEST_START_ROW, QUOTE_DEST_START_COL)
-    if start.Value not in (None, ""):
-        region = start.CurrentRegion
-        region_last_row = region.Row + region.Rows.Count - 1
-        region_last_col = region.Column + region.Columns.Count - 1
-        clear_start_col = max(QUOTE_DEST_START_COL, region.Column)
-        if (
-            region_last_row >= QUOTE_DEST_START_ROW
-            and region_last_col >= clear_start_col
-        ):
-            ws.Range(
-                ws.Cells(QUOTE_DEST_START_ROW, clear_start_col),
-                ws.Cells(region_last_row, region_last_col),
-            ).ClearContents()
-
-
-def recalculate_lookup_keys(excel, dest_wb, master_ws, expiring_ws):
-    """Force formula-driven lookup keys to update while calculation is manual."""
-    log("Recalculating template formulas before reading lookup keys...")
-    try:
-        master_ws.Calculate()
-        expiring_ws.Calculate()
-        excel.CalculateFullRebuild()
-    except Exception as exc:
+    if target_nonblank != source_nonblank:
         raise RuntimeError(
-            "Excel could not recalculate the template lookup formulas."
-        ) from exc
-
-    # Wait for Excel calculation to finish (0 = xlDone).
-    deadline = time.time() + 120
-    while excel.CalculationState != 0:
-        if time.time() >= deadline:
-            raise TimeoutError("Excel calculation did not finish within 120 seconds.")
-        time.sleep(0.2)
-    log("Template formula recalculation completed.")
-
-
-def resize_quote_master_table(destination, target):
-    """Resize an Excel table beginning at J2 so pivots include new rows."""
-    resized = 0
-    try:
-        tables = destination.ListObjects
-        for index in range(1, tables.Count + 1):
-            table = tables.Item(index)
-            table_range = table.Range
-            if (
-                table_range.Row == QUOTE_DEST_START_ROW
-                and table_range.Column == QUOTE_DEST_START_COL
-            ):
-                table.Resize(target)
-                resized += 1
-                log(
-                    f"Resized Quote Master table {table.Name} to "
-                    f"{target.Address(False, False)}."
-                )
-    except Exception as exc:
-        raise RuntimeError("Failed while resizing the Quote Master table.") from exc
-
-    if resized == 0:
-        log(
-            "No Excel table begins at Quote Master J2; copied range was "
-            "written, and existing pivot source configuration will be used."
-        )
-    return resized
-
-
-def copy_quote_data_to_template(quote_wb, dest_wb):
-    """Copy Quote B2:last used cell into Quote Master beginning at J2."""
-    quote_ws = find_quote_source_sheet(quote_wb)
-    last_row, last_col = quote_data_bounds(quote_ws)
-    row_count = last_row - QUOTE_SOURCE_START_ROW + 1
-    column_count = last_col - QUOTE_SOURCE_START_COL + 1
-
-    source = quote_ws.Range(
-        quote_ws.Cells(QUOTE_SOURCE_START_ROW, QUOTE_SOURCE_START_COL),
-        quote_ws.Cells(last_row, last_col),
-    ).Value
-
-    try:
-        destination = dest_wb.Worksheets(QUOTE_MASTER_SHEET)
-    except Exception as exc:
-        raise ValueError(
-            f"Template sheet not found: {QUOTE_MASTER_SHEET}"
-        ) from exc
-
-    clear_previous_quote_data(destination)
-    target = destination.Range(
-        destination.Cells(QUOTE_DEST_START_ROW, QUOTE_DEST_START_COL),
-        destination.Cells(
-            QUOTE_DEST_START_ROW + row_count - 1,
-            QUOTE_DEST_START_COL + column_count - 1,
-        ),
-    )
-    target.Value = source
-    resized_table_count = resize_quote_master_table(destination, target)
-
-    if target.Value != source:
-        raise RuntimeError(
-            "Quote transfer validation failed after writing to "
-            f"{QUOTE_MASTER_SHEET}!J2."
+            "Quote B2 to Quote Master J2 copy validation failed: "
+            f"source has {source_nonblank} populated cells, destination has "
+            f"{target_nonblank}."
         )
 
     log(
-        f"Copied Quote B2:{quote_ws.Cells(last_row, last_col).Address(False, False)} "
+        f"Copied {source_ws.Name}!B2:{source_ws.Cells(last_row, last_col).Address(False, False)} "
         f"to {QUOTE_MASTER_SHEET}!J2 "
         f"({row_count} rows x {column_count} columns)."
     )
-    return row_count, column_count, resized_table_count
-
-
-def refresh_quote_pivots(dest_wb, excel):
-    """Fully recalculate, refresh caches, and verify renewal pivot refreshes."""
-    try:
-        pivot_ws = dest_wb.Worksheets(QUOTE_PIVOT_SHEET)
-    except Exception as exc:
-        raise ValueError(
-            f"Template sheet not found: {QUOTE_PIVOT_SHEET}"
-        ) from exc
 
     pivot_tables = pivot_ws.PivotTables()
     pivot_count = pivot_tables.Count
     if pivot_count < 1:
-        raise ValueError(
-            f"No pivot tables were found on {QUOTE_PIVOT_SHEET}."
-        )
+        raise ValueError(f"No pivot table found on {QUOTE_PIVOT_SHEET}.")
+    log(
+        f"Quote copy validation passed. Refreshing {pivot_count} pivot "
+        f"table(s) on {QUOTE_PIVOT_SHEET}..."
+    )
 
-    # Pivot refresh is more reliable with automatic calculation enabled.
-    excel.Calculation = XL_CALCULATION_AUTOMATIC
-    excel.CalculateFullRebuild()
-    try:
-        dest_wb.RefreshAll()
-        excel.CalculateUntilAsyncQueriesDone()
-    except Exception:
-        # Not all Excel versions expose async-query waiting; individual pivot
-        # cache refresh below is still required and verified.
-        pass
-
-    refreshed = 0
     for index in range(1, pivot_count + 1):
         pivot = pivot_tables.Item(index)
-        cache = pivot.PivotCache()
-        source_data = "<unavailable>"
-        try:
-            source_data = str(cache.SourceData)
-        except Exception:
-            pass
+        pivot.PivotCache().Refresh()
+        result = pivot.RefreshTable()
+        if result is False:
+            raise RuntimeError(f"Pivot refresh failed: {pivot.Name}")
+        log(f"Refreshed pivot table: {pivot.Name}")
 
-        cache.Refresh()
-        refresh_result = pivot.RefreshTable()
-        try:
-            pivot.Update()
-        except Exception:
-            pass
+    return row_count, column_count, pivot_count
 
-        if refresh_result is False:
-            raise RuntimeError(f"Pivot refresh returned False: {pivot.Name}")
-        refreshed += 1
-        log(
-            f"Refreshed pivot table {pivot.Name}; "
-            f"source={source_data}"
-        )
 
-    excel.CalculateFullRebuild()
-    if refreshed != pivot_count:
-        raise RuntimeError(
-            f"Expected {pivot_count} pivot refreshes, completed {refreshed}."
-        )
-    log(f"Verified refresh for {refreshed} pivot table(s) on {QUOTE_PIVOT_SHEET}.")
-    return refreshed
+def fill_expiring_lookup_key_formulas(ws):
+    """Fill B with F&G through the last active row in Column D."""
+    previous_last_b = ws.Cells(ws.Rows.Count, 2).End(XL_UP).Row
+    current_last_d = ws.Cells(ws.Rows.Count, 4).End(XL_UP).Row
+
+    if current_last_d < DEST_START_ROW:
+        if previous_last_b >= DEST_START_ROW:
+            ws.Range(
+                ws.Cells(DEST_START_ROW, 2),
+                ws.Cells(previous_last_b, 2),
+            ).ClearContents()
+        log("No Expiring Dump Column D records found; Column B was not filled.")
+        return current_last_d
+
+    # Seed B3 with State F + Class Code G, then drag/fill the relative formula
+    # down through the final record identified by Column D.
+    ws.Cells(DEST_START_ROW, 2).Formula = (
+        f"=F{DEST_START_ROW}&G{DEST_START_ROW}"
+    )
+    formula_range = ws.Range(
+        ws.Cells(DEST_START_ROW, 2),
+        ws.Cells(current_last_d, 2),
+    )
+    if current_last_d > DEST_START_ROW:
+        formula_range.FillDown()
+
+    # Calculation is manual during this script, so calculate these lookup keys
+    # now before the Rates Payroll matching step reads Column B values.
+    formula_range.Calculate()
+
+    # Remove formulas left from a previous longer run, without touching the
+    # current B3:last-D formula range.
+    if previous_last_b > current_last_d:
+        ws.Range(
+            ws.Cells(current_last_d + 1, 2),
+            ws.Cells(previous_last_b, 2),
+        ).ClearContents()
+
+    log(
+        f"Filled Expiring Dump lookup formulas "
+        f"B{DEST_START_ROW}:B{current_last_d} using F&G."
+    )
+    return current_last_d
 
 
 def main():
@@ -525,10 +423,9 @@ def main():
             f"D{DEST_START_ROW}:G{last_data_row}"
         ).Value = expiring_records
 
-        # Expiring Dump Column B is formula-driven from the transferred data.
-        # Calculation is currently manual for performance, so force it now
-        # before B is read as the Manual Rate lookup key.
-        recalculate_lookup_keys(excel, dest_wb, master_ws, expiring_ws)
+        # Build the Expiring Dump lookup key before Rates Payroll matching.
+        # Example: if Column D ends at row 50, fill B3:B50 with =Frow&Grow.
+        fill_expiring_lookup_key_formulas(expiring_ws)
 
         # STEP 3: Prepare Rates Payroll Column P and look up into Expiring Dump.
         log("Opening Rates Payroll workbook...")
@@ -634,21 +531,6 @@ def main():
                     expiring_ws.Cells(template_last_row, 6)
                 ).Value2
             )
-            nonblank_b_keys = sum(
-                1 for row in template_keys if make_lookup_key(row[0])
-            )
-            nonblank_f_keys = sum(
-                1 for row in template_keys if make_lookup_key(row[4])
-            )
-            log(
-                f"Calculated Expiring lookup keys: "
-                f"B nonblank={nonblank_b_keys}, F nonblank={nonblank_f_keys}"
-            )
-            if nonblank_b_keys == 0:
-                log(
-                    "WARNING: Expiring Dump Column B contains no calculated "
-                    "keys; Column H cannot match Rates Payroll Column P."
-                )
 
             output_h = []
             output_k = []
@@ -698,11 +580,14 @@ def main():
 
         # Stage 1 indication: count rates still blank after Rates Payroll
         # lookups. H is Manual Rate; K is All-In Fund Rate.
+        # Count blanks only across this run's imported UW records (rows 3 to
+        # last_data_row). Formula-filled Column B can extend much farther down
+        # and must not inflate the H/K blank summary.
         blank_h_count = count_blank_cells(
-            expiring_ws, 8, DEST_START_ROW, template_last_row
+            expiring_ws, 8, DEST_START_ROW, last_data_row
         )
         blank_k_count = count_blank_cells(
-            expiring_ws, 11, DEST_START_ROW, template_last_row
+            expiring_ws, 11, DEST_START_ROW, last_data_row
         )
         log(
             f"BLANK SUMMARY: Expiring Dump H (Manual Rate): "
@@ -720,39 +605,31 @@ def main():
         else:
             log("No PDF Manual Rate fallback is required for Column H.")
 
-        # STEP 4: Quote workbook B2:last used cell -> Quote Master J2,
-        # then refresh all configured renewal pivot tables.
+        # FINAL STEP: preserve all existing UW/Rates logic, then copy the Quote
+        # data block from B2 into Quote Master J2 and refresh renewal pivots.
         log("Opening Quote workbook read-only...")
         quote_wb = excel.Workbooks.Open(
             str(QUOTE_FILE), UpdateLinks=0, ReadOnly=True
         )
-        quote_row_count, quote_column_count, resized_table_count = (
-            copy_quote_data_to_template(
-                quote_wb,
-                dest_wb,
-            )
+        quote_rows, quote_columns, pivot_count = (
+            copy_quote_block_and_refresh_pivot(quote_wb, dest_wb)
         )
-        pivot_count = refresh_quote_pivots(dest_wb, excel)
 
-        # Validate the complete D:G transfer before either edited workbook is
-        # saved. A failed run is closed without saving in the finally block.
-        master_transfer = master_ws.Range(
-            f"D{DEST_START_ROW}:G{last_data_row}"
-        ).Value
-        expiring_transfer = expiring_ws.Range(
-            f"D{DEST_START_ROW}:G{last_data_row}"
-        ).Value
-        if master_transfer != expiring_transfer:
-            raise RuntimeError(
-                "Validation failed: Expiring Dump D:G does not fully match "
-                "Master Comparision D:G."
-            )
-
+        # Save both edited workbooks.
         log("Saving Rates Payroll workbook...")
         rates_wb.Save()
 
-        log("Saving template workbook after pivot refresh...")
+        log("Saving template workbook...")
         dest_wb.Save()
+
+        # Validate the D:G transfer from Step 2.
+        first_master = master_ws.Range("D3:G3").Value
+        first_expiring = expiring_ws.Range("D3:G3").Value
+        if first_master != first_expiring:
+            raise RuntimeError(
+                "Validation failed: first row in Expiring Dump "
+                "does not match Master Comparision."
+            )
 
         log(f"Validation passed: {count} rows copied to Master Comparision.")
         log(f"Validation passed: {count} rows copied to Expiring Dump D:G.")
@@ -767,7 +644,11 @@ def main():
             "Unique F->H lookup keys (return N): "
             f"{len(lookup_f_to_n)}"
         )
-        log(f"Expiring Dump rows checked: {max(0, template_last_row - 2)}")
+        log(
+            f"Expiring Dump lookup rows processed: "
+            f"{max(0, template_last_row - 2)}"
+        )
+        log(f"Current imported rows used for blank summary: {count}")
         log(f"B->P matches found for destination H: {match_count_b}")
         log(f"Nonblank B keys with no P match: {missing_count_b}")
         log(f"F->H matches found for destination K: {match_count_f}")
@@ -775,16 +656,14 @@ def main():
         log(f"Blank H Manual Rates after Rates lookup: {blank_h_count}")
         log(f"Blank K All-In Fund Rates after Rates lookup: {blank_k_count}")
         log(
-            f"Quote data copied to {QUOTE_MASTER_SHEET}!J2: "
-            f"{quote_row_count} rows x {quote_column_count} columns"
+            f"Quote block copied: {quote_rows} rows x {quote_columns} columns"
         )
-        log(f"Quote Master Excel tables resized: {resized_table_count}")
-        log(f"Renewal pivot tables refreshed: {pivot_count}")
+        log(f"KeyRisk renewal pivot tables refreshed: {pivot_count}")
         log("Expiring B -> Rates P -> Rates L -> Expiring H.")
         log("Expiring F -> Rates H -> Rates N -> Expiring K.")
         log(
-            "STAGE 1 SUCCESS: UW/Rates lookups, Quote transfer, and "
-            "pivot refresh completed."
+            "STAGE 1 SUCCESS: existing UW/Rates logic completed; Quote data "
+            "copied and renewal pivot refreshed."
         )
 
     finally:
@@ -796,7 +675,7 @@ def main():
 
         if rates_wb is not None:
             try:
-                rates_wb.Close(SaveChanges=False)
+                rates_wb.Close(SaveChanges=True)
             except Exception:
                 pass
 
@@ -808,7 +687,7 @@ def main():
 
         if dest_wb is not None:
             try:
-                dest_wb.Close(SaveChanges=False)
+                dest_wb.Close(SaveChanges=True)
             except Exception:
                 pass
 
