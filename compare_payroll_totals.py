@@ -16,8 +16,8 @@ Quote workbook:
 - Class Code: Column H.
 - Payroll: Column J.
 
-If the totals match after standard whole-dollar rounding, the script prints MATCH
-and does not modify a workbook. If they differ, it creates/replaces a "Payroll Comparison" sheet in
+If the rounded totals differ by no more than $1, the script prints MATCH and
+does not modify a workbook. If they differ by more than $1, it creates/replaces a "Payroll Comparison" sheet in
 the Quote workbook showing payroll differences by State and Class Code. A
 backup of the Quote workbook is created before that workbook is modified.
 
@@ -49,6 +49,7 @@ REPORT_SHEET = "Payroll Comparison"
 
 DATA_START_ROW = 2
 WHOLE_DOLLAR = Decimal("1")
+DIFFERENCE_TOLERANCE = Decimal("1")
 
 XL_UP = -4162
 XL_TO_LEFT = -4159
@@ -266,7 +267,7 @@ def difference_rows(uw_grouped, quote_grouped):
         uw_payroll = money(uw_grouped.get((state, class_code), Decimal("0")))
         quote_payroll = money(quote_grouped.get((state, class_code), Decimal("0")))
         difference = money(uw_payroll - quote_payroll)
-        if difference == Decimal("0"):
+        if abs(difference) <= DIFFERENCE_TOLERANCE:
             continue
         rows.append(
             (
@@ -372,11 +373,14 @@ def main():
         log(f"UW Column R total (rounded): {uw_total:,.0f}")
         log(f"Filtered Quote Column J total (rounded): {quote_total:,.0f}")
 
-        if uw_total == quote_total:
-            log("MATCH: Rounded UW and Quote payroll totals are equal.")
+        total_difference = money(uw_total - quote_total)
+        if abs(total_difference) <= DIFFERENCE_TOLERANCE:
+            log(
+                "MATCH: Rounded UW and Quote payroll totals are within "
+                f"the allowed $1 tolerance (difference: {total_difference:,.0f})."
+            )
             return
 
-        total_difference = money(uw_total - quote_total)
         rows = difference_rows(uw_grouped, quote_grouped)
         log(f"MISMATCH: Rounded UW - Quote payroll difference: {total_difference:,.0f}")
         log(f"State/Class combinations with differences: {len(rows)}")

@@ -79,7 +79,7 @@ Before the main transfer, compare UW `Master` Column R against the Quote workboo
 ```
 python compare_payroll_totals.py
 ```
-If totals match after standard whole-dollar rounding, the script prints `MATCH` and does not modify either workbook. If they differ, it backs up the Quote workbook and creates/replaces a `Payroll Comparison` sheet containing whole-dollar differences grouped by State and Class Code.
+If rounded totals differ by no more than $1, the script prints `MATCH` and does not modify either workbook. If they differ by more than $1, it backs up the Quote workbook and creates/replaces a `Payroll Comparison` sheet containing whole-dollar differences grouped by State and Class Code; grouped differences of $1 or less are omitted.
 
 Main workflow
 1. Save the approved script in your local scripts/ folder.
