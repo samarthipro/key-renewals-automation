@@ -165,6 +165,50 @@ def read_uw_payroll(ws):
     return money(total), grouped, last_row - DATA_START_ROW + 1
 
 
+def find_quote_data_sheet(workbook):
+    """Find the Quote sheet with the most qualifying Column F records."""
+    best_sheet = None
+    best_count = 0
+
+    for index in range(1, workbook.Worksheets.Count + 1):
+        worksheet = workbook.Worksheets(index)
+        if worksheet.Name.casefold() == REPORT_SHEET.casefold():
+            continue
+        try:
+            last_row = worksheet.Cells(
+                worksheet.Rows.Count, 6
+            ).End(XL_UP).Row
+            if last_row < DATA_START_ROW:
+                continue
+            values = as_rows(
+                worksheet.Range(
+                    worksheet.Cells(DATA_START_ROW, 6),
+                    worksheet.Cells(last_row, 6),
+                ).Value2
+            )
+            qualifying = sum(
+                1
+                for row in values
+                if "classcode" in normalize_marker(row[0])
+            )
+            if qualifying > best_count:
+                best_sheet = worksheet
+                best_count = qualifying
+        except Exception:
+            continue
+
+    if best_sheet is None:
+        raise ValueError(
+            "No Quote worksheet contains qualifying 'Classcode' values "
+            "in Column F."
+        )
+    log(
+        f"Using Quote worksheet {best_sheet.Name!r} "
+        f"({best_count} qualifying rows)."
+    )
+    return best_sheet
+
+
 def read_quote_payroll(ws):
     """Return filtered Quote total and payroll grouped by (State G, Class H)."""
     last_row = last_used_row(ws, (6, 7, 8, 10))  # F, G, H, J
@@ -318,7 +362,7 @@ def main():
         quote_workbook = excel.Workbooks.Open(
             str(QUOTE_FILE), UpdateLinks=0, ReadOnly=False
         )
-        quote_sheet = quote_workbook.Worksheets(1)
+        quote_sheet = find_quote_data_sheet(quote_workbook)
 
         uw_total, uw_grouped, uw_count = read_uw_payroll(uw_sheet)
         quote_total, quote_grouped, quote_count = read_quote_payroll(quote_sheet)
