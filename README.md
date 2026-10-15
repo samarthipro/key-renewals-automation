@@ -9,7 +9,8 @@ The workflow currently covers:
 3. Copying required fields into Expiring Dump (KeyRisk).
 4. Preparing lookup keys from Lotus Merged Payroll in Rates Payroll.xlsx.
 5. Performing two separate lookups to populate Expiring Dump output columns.
-6. Saving updated workbooks and reporting match statistics.
+6. Filling unmatched rates from the downloaded policy PDF by State and Class Code.
+7. Saving updated workbooks and reporting match statistics.
 Workflow details
 1. UW data transfer
 Source: Lotus HR Inc Template 26-27 UW V2.xlsx, worksheet Master.
@@ -35,10 +36,14 @@ Second	Expiring Dump Column F matched against Rates Payroll Column H	Rates Payro
 
 
 The script uses the first occurrence when duplicate keys exist. Unmatched keys are left blank and included in summary counts.
+
+5. Policy PDF rate fallback
+For blank values in Expiring Dump Column H, the script reads State from Column F and Class Code from Column G. It selects the newest PDF in the local `downloads/` folder, extracts the table column headed `Rate Per $100 of Remuneration`, and fills H when the PDF State and Class Code match exactly. Rows not found in the PDF remain blank and are logged.
 Technology stack
 - Python 3
 - Microsoft Excel desktop
 - pywin32 for Excel COM automation
+- pdfplumber for extracting State, Class Code, and Rate from policy PDFs
 - Git and GitHub for version control
 - Kiro for development
 Requirements
@@ -48,8 +53,11 @@ Requirements
 - pywin32
 Install the dependency:
 python -m pip install -r requirements.txt
-requirements.txt should contain:
-pywin32>=306
+requirements.txt includes:
+- pywin32>=306
+- playwright>=1.47
+- python-dotenv>=1.0
+- pdfplumber>=0.11
 Suggested project structure
 key-renewals-automation/
 ├── scripts/
@@ -65,6 +73,15 @@ Scripts may contain local absolute paths such as:
 C:\Users\<username>\Documents\Key Risk automation
 Update the paths for your computer before running. A future improvement is to move paths into a local configuration file excluded from version control.
 Running the automation
+
+Payroll preflight check (run first)
+Before the main transfer, compare UW `Master` Column R against the Quote workbook's Column J for rows whose Column F contains `Classcode`:
+```
+python compare_payroll_totals.py
+```
+If totals match, the script prints `MATCH` and does not modify either workbook. If they differ, it backs up the Quote workbook and creates/replaces a `Payroll Comparison` sheet containing differences grouped by State and Class Code.
+
+Main workflow
 1. Save the approved script in your local scripts/ folder.
 2. Confirm that all configured file paths exist.
 3. Close the workbooks in Excel.
