@@ -68,6 +68,7 @@ key-renewals-automation/
 ├── compare_payroll_totals.py
 ├── uw_to_template_rates.py
 ├── fill_manual_rates_from_pdf.py
+├── fill_emod_from_pdfs.py
 ├── epic_chrome_worker.py
 ├── .gitignore
 ├── requirements.txt
@@ -97,6 +98,12 @@ python uw_to_template_rates.py
 python fill_manual_rates_from_pdf.py
 ```
 Stage 2 fills only blank H cells from PDF State/Class matches and reports the remaining H blanks plus unchanged K blanks.
+
+4. Fill E-Mod values from the two PDFs into `Master Comparision` through the last record in Column C:
+```
+python fill_emod_from_pdfs.py
+```
+This writes the value adjacent to `Experience Modification` in `downloads/Lotus HR, Inc.pdf` into Column I, and the decimal Rate on the `Experience Mod Final` row in `Quote/Q-279399_Lotus_HR_Inc_Master_v2.pdf` into Column O. Values are filled from row 3 through the last nonblank Column C row.
 
 Test with copies of the workbooks first and verify the results before using them in a live renewal workflow.
 Validation and troubleshooting
