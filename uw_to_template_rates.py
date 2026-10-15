@@ -14,6 +14,7 @@ BASE_DIR = Path(r"C:\Users\Samarth\Documents\Key Risk automation")
 
 SOURCE_FILE = BASE_DIR / "UW" / "Lotus HR Inc Template 26-27 UW V2.xlsx"
 RATES_FILE = BASE_DIR / "Expiry" / "Rates Payroll.xlsx"
+QUOTE_FILE = BASE_DIR / "Quote" / "Q-279399_Lotus_HR_Inc_Master_v2.xlsx"
 TEMPLATE_FILE = (
     BASE_DIR
     / "template"
@@ -24,6 +25,8 @@ SOURCE_SHEET = "Master"
 RATES_SHEET = "Lotus Merged Payroll"
 DESTINATION_SHEET = "Master Comparision"
 EXPIRING_SHEET = "Expiring Dump (KeyRisk)"
+QUOTE_MASTER_SHEET = "KeyRisk_Renewal_Quote_Master"
+QUOTE_PIVOT_SHEET = "KeyRisk_Renewal_Pivot"
 
 HEADERS = [
     "Client Id",
@@ -113,10 +116,95 @@ def count_blank_cells(ws, column, start_row, last_row):
     return sum(1 for row in values if row[0] in (None, ""))
 
 
+def find_quote_source_sheet(workbook):
+    """Choose the Quote sheet with the most Classcode rows in Column F."""
+    selected = None
+    highest_count = -1
+    for index in range(1, workbook.Worksheets.Count + 1):
+        sheet = workbook.Worksheets(index)
+        last_row = sheet.Cells(sheet.Rows.Count, 6).End(XL_UP).Row
+        if last_row < 2:
+            continue
+        values = as_rows(sheet.Range(sheet.Cells(2, 6), sheet.Cells(last_row, 6)).Value2)
+        classcode_count = sum(
+            1 for row in values if "classcode" in normalize(row[0])
+        )
+        if classcode_count > highest_count:
+            selected = sheet
+            highest_count = classcode_count
+
+    if selected is None:
+        raise ValueError("No populated worksheet was found in the Quote workbook.")
+    log(f"Using Quote source sheet: {selected.Name}")
+    return selected
+
+
+def copy_quote_block_and_refresh_pivot(quote_wb, template_wb):
+    """Copy the contiguous Quote block from B2 to J2 and refresh pivots."""
+    source_ws = find_quote_source_sheet(quote_wb)
+    anchor = source_ws.Cells(2, 2)  # B2
+    if anchor.Value in (None, ""):
+        raise ValueError(f"Quote source cell {source_ws.Name}!B2 is blank.")
+
+    source_region = anchor.CurrentRegion
+    last_row = source_region.Row + source_region.Rows.Count - 1
+    last_col = source_region.Column + source_region.Columns.Count - 1
+    if last_row < 2 or last_col < 2:
+        raise ValueError("No Quote data block was found beginning at B2.")
+
+    source_range = source_ws.Range(
+        source_ws.Cells(2, 2),
+        source_ws.Cells(last_row, last_col),
+    )
+    row_count = source_range.Rows.Count
+    column_count = source_range.Columns.Count
+
+    try:
+        master_ws = template_wb.Worksheets(QUOTE_MASTER_SHEET)
+        pivot_ws = template_wb.Worksheets(QUOTE_PIVOT_SHEET)
+    except Exception as exc:
+        raise ValueError(
+            f"Required template sheet missing: {QUOTE_MASTER_SHEET} "
+            f"or {QUOTE_PIVOT_SHEET}"
+        ) from exc
+
+    target_range = master_ws.Range(
+        master_ws.Cells(2, 10),  # J2
+        master_ws.Cells(2 + row_count - 1, 10 + column_count - 1),
+    )
+    source_values = source_range.Value
+    target_range.Value = source_values
+
+    if target_range.Value != source_values:
+        raise RuntimeError("Quote B2 to Quote Master J2 copy validation failed.")
+
+    log(
+        f"Copied {source_ws.Name}!B2:{source_ws.Cells(last_row, last_col).Address(False, False)} "
+        f"to {QUOTE_MASTER_SHEET}!J2 "
+        f"({row_count} rows x {column_count} columns)."
+    )
+
+    pivot_tables = pivot_ws.PivotTables()
+    pivot_count = pivot_tables.Count
+    if pivot_count < 1:
+        raise ValueError(f"No pivot table found on {QUOTE_PIVOT_SHEET}.")
+
+    for index in range(1, pivot_count + 1):
+        pivot = pivot_tables.Item(index)
+        pivot.PivotCache().Refresh()
+        result = pivot.RefreshTable()
+        if result is False:
+            raise RuntimeError(f"Pivot refresh failed: {pivot.Name}")
+        log(f"Refreshed pivot table: {pivot.Name}")
+
+    return row_count, column_count, pivot_count
+
+
 def main():
     for path, label in (
         (SOURCE_FILE, "UW workbook"),
         (RATES_FILE, "Rates Payroll workbook"),
+        (QUOTE_FILE, "Quote workbook"),
         (TEMPLATE_FILE, "Template workbook"),
     ):
         if not path.exists():
@@ -134,6 +222,7 @@ def main():
     excel = None
     source_wb = None
     rates_wb = None
+    quote_wb = None
     dest_wb = None
     old_calculation = None
     old_screen = None
@@ -437,6 +526,16 @@ def main():
         else:
             log("No PDF Manual Rate fallback is required for Column H.")
 
+        # FINAL STEP: preserve all existing UW/Rates logic, then copy the Quote
+        # data block from B2 into Quote Master J2 and refresh renewal pivots.
+        log("Opening Quote workbook read-only...")
+        quote_wb = excel.Workbooks.Open(
+            str(QUOTE_FILE), UpdateLinks=0, ReadOnly=True
+        )
+        quote_rows, quote_columns, pivot_count = (
+            copy_quote_block_and_refresh_pivot(quote_wb, dest_wb)
+        )
+
         # Save both edited workbooks.
         log("Saving Rates Payroll workbook...")
         rates_wb.Save()
@@ -473,9 +572,16 @@ def main():
         log(f"Nonblank F keys with no H match: {missing_count_f}")
         log(f"Blank H Manual Rates after Rates lookup: {blank_h_count}")
         log(f"Blank K All-In Fund Rates after Rates lookup: {blank_k_count}")
+        log(
+            f"Quote block copied: {quote_rows} rows x {quote_columns} columns"
+        )
+        log(f"KeyRisk renewal pivot tables refreshed: {pivot_count}")
         log("Expiring B -> Rates P -> Rates L -> Expiring H.")
         log("Expiring F -> Rates H -> Rates N -> Expiring K.")
-        log("STAGE 1 SUCCESS: UW transfer and Rates Payroll lookups completed.")
+        log(
+            "STAGE 1 SUCCESS: existing UW/Rates logic completed; Quote data "
+            "copied and renewal pivot refreshed."
+        )
 
     finally:
         if source_wb is not None:
@@ -487,6 +593,12 @@ def main():
         if rates_wb is not None:
             try:
                 rates_wb.Close(SaveChanges=True)
+            except Exception:
+                pass
+
+        if quote_wb is not None:
+            try:
+                quote_wb.Close(SaveChanges=False)
             except Exception:
                 pass
 
