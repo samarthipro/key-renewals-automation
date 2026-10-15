@@ -1,6 +1,5 @@
 from pathlib import Path
 from datetime import datetime
-import re
 import shutil
 import sys
 
@@ -12,11 +11,6 @@ except ImportError:
 
 
 BASE_DIR = Path(r"C:\Users\Samarth\Documents\Key Risk automation")
-PDF_DOWNLOAD_DIR = BASE_DIR / "downloads"
-
-# Leave as None to use the newest PDF in PDF_DOWNLOAD_DIR. To force a specific
-# policy PDF, assign a full Path here.
-POLICY_PDF_FILE = None
 
 SOURCE_FILE = BASE_DIR / "UW" / "Lotus HR Inc Template 26-27 UW V2.xlsx"
 RATES_FILE = BASE_DIR / "Expiry" / "Rates Payroll.xlsx"
@@ -106,229 +100,17 @@ def find_header_columns(ws, headers, header_row=1):
     return [found[normalize(h)] for h in headers]
 
 
-def normalize_state(value):
-    """Normalize a two-letter state code for PDF/Excel matching."""
-    state = cell_text(value).upper()
-    return state if re.fullmatch(r"[A-Z]{2}", state) else ""
-
-
-def normalize_class_code(value):
-    """Normalize numeric class codes while tolerating Excel float values."""
-    text = cell_text(value)
-    digits = re.sub(r"\D", "", text)
-    if not digits:
-        return ""
-    return digits.lstrip("0") or "0"
-
-
-def parse_rate(value):
-    """Convert a PDF table rate cell to a non-negative number."""
-    if isinstance(value, (int, float)):
-        rate = float(value)
-        return rate if rate >= 0 else None
-
-    text = cell_text(value).replace(",", "").replace("$", "")
-    match = re.search(r"-?\d+(?:\.\d+)?", text)
-    if not match:
-        return None
-    rate = float(match.group(0))
-    return rate if rate >= 0 else None
-
-
-def add_policy_rate(rates, state, class_code, rate):
-    """Add the first valid rate for a normalized state/class pair."""
-    state_key = normalize_state(state)
-    class_key = normalize_class_code(class_code)
-    parsed_rate = parse_rate(rate)
-    if not state_key or not class_key or parsed_rate is None:
-        return
-
-    key = (state_key, class_key)
-    if key not in rates:
-        rates[key] = parsed_rate
-    elif rates[key] != parsed_rate:
-        log(
-            f"WARNING: PDF contains multiple rates for {state_key} "
-            f"class {class_key}: {rates[key]} and {parsed_rate}. "
-            "Keeping the first rate."
-        )
-
-
-def find_table_headers(table):
-    """Find State, Class Code, and Rate columns in a PDF-extracted table."""
-    if not table:
-        return None
-
-    # Some PDFs split multi-line headers into two or three physical rows.
-    for start in range(min(10, len(table))):
-        for depth in range(1, 4):
-            rows = table[start:start + depth]
-            if len(rows) < depth:
-                continue
-            width = max((len(row or []) for row in rows), default=0)
-            combined = []
-            for column in range(width):
-                parts = []
-                for row in rows:
-                    if row and column < len(row) and row[column] is not None:
-                        parts.append(cell_text(row[column]))
-                combined.append(normalize(" ".join(parts)))
-
-            state_column = next(
-                (i for i, value in enumerate(combined) if value == "state"),
-                None,
-            )
-            class_column = next(
-                (i for i, value in enumerate(combined) if "classcode" in value),
-                None,
-            )
-            rate_column = next(
-                (
-                    i
-                    for i, value in enumerate(combined)
-                    if "rateper100" in value
-                    or ("rate" in value and "remuneration" in value)
-                ),
-                None,
-            )
-            if None not in (state_column, class_column, rate_column):
-                return start + depth, state_column, class_column, rate_column
-    return None
-
-
-def extract_rates_from_tables(page, rates):
-    """Extract policy rates from recognized PDF tables on one page."""
-    for table in page.extract_tables() or []:
-        header = find_table_headers(table)
-        if header is None:
-            continue
-        data_start, state_column, class_column, rate_column = header
-        required_column = max(state_column, class_column, rate_column)
-        for row in table[data_start:]:
-            if not row or len(row) <= required_column:
-                continue
-            add_policy_rate(
-                rates,
-                row[state_column],
-                row[class_column],
-                row[rate_column],
-            )
-
-
-def extract_rates_from_text(page, rates):
-    """Fallback for PDFs whose visual table has no extractable cell borders."""
-    text = page.extract_text(layout=True) or page.extract_text() or ""
-    row_start = re.compile(r"^\s*([A-Z]{2})\s+(\d{3,8})\s+(.+?)\s*$")
-    # Typical row ending: annual payroll, rate per $100, annual premium.
-    row_end = re.compile(
-        r"(?:\$?\(?-?[\d,]+(?:\.\d+)?\)?)\s+"
-        r"(\d+(?:\.\d+)?)\s+"
-        r"\$?\(?-?[\d,]+(?:\.\d+)?\)?\s*$"
-    )
-
-    for line in text.splitlines():
-        start_match = row_start.match(line)
-        if not start_match:
-            continue
-        state, class_code, remainder = start_match.groups()
-        rate_match = row_end.search(remainder)
-        if rate_match:
-            add_policy_rate(rates, state, class_code, rate_match.group(1))
-
-
-def select_policy_pdf():
-    """Return the configured PDF or the newest downloaded PDF."""
-    if POLICY_PDF_FILE is not None:
-        pdf_path = Path(POLICY_PDF_FILE)
-        if not pdf_path.exists():
-            raise FileNotFoundError(f"Configured policy PDF not found: {pdf_path}")
-        return pdf_path
-
-    if not PDF_DOWNLOAD_DIR.exists():
-        raise FileNotFoundError(
-            f"Policy download folder not found: {PDF_DOWNLOAD_DIR}"
-        )
-    pdf_files = [
-        path
-        for path in PDF_DOWNLOAD_DIR.iterdir()
-        if path.is_file() and path.suffix.casefold() == ".pdf"
-    ]
-    if not pdf_files:
-        raise FileNotFoundError(
-            f"No PDF files found in: {PDF_DOWNLOAD_DIR}"
-        )
-    return max(pdf_files, key=lambda path: path.stat().st_mtime)
-
-
-def extract_policy_rates(pdf_path):
-    """Build a {(state, class_code): rate} map from a policy PDF."""
-    try:
-        import pdfplumber
-    except ImportError as exc:
-        raise RuntimeError(
-            "PDF fallback requires pdfplumber. Install dependencies with: "
-            "python -m pip install -r requirements.txt"
-        ) from exc
-
-    rates = {}
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            extract_rates_from_tables(page, rates)
-            extract_rates_from_text(page, rates)
-    return rates
-
-
-def fill_blank_expiring_rates_from_pdf(expiring_ws, last_row):
-    """Fill blank H using F=State, G=Class Code and the downloaded PDF."""
-    if last_row < DEST_START_ROW:
-        return 0, 0
-
-    rows = as_rows(
-        expiring_ws.Range(
-            expiring_ws.Cells(DEST_START_ROW, 6),
-            expiring_ws.Cells(last_row, 8),
+def count_blank_cells(ws, column, start_row, last_row):
+    """Count blank cells in a destination column over the imported row range."""
+    if last_row < start_row:
+        return 0
+    values = as_rows(
+        ws.Range(
+            ws.Cells(start_row, column),
+            ws.Cells(last_row, column),
         ).Value2
     )
-    missing_rows = []
-    for offset, row in enumerate(rows):
-        state = normalize_state(row[0])
-        class_code = normalize_class_code(row[1])
-        current_rate = row[2]
-        if current_rate in (None, ""):
-            missing_rows.append((DEST_START_ROW + offset, state, class_code))
-
-    if not missing_rows:
-        log("No blank Expiring Dump H rates require PDF fallback.")
-        return 0, 0
-
-    pdf_path = select_policy_pdf()
-    log(f"Reading PDF fallback rates from: {pdf_path}")
-    policy_rates = extract_policy_rates(pdf_path)
-    if not policy_rates:
-        raise ValueError(
-            f"No State/Class/Rate rows could be extracted from PDF: {pdf_path}"
-        )
-    log(f"Unique State/Class rates extracted from PDF: {len(policy_rates)}")
-
-    filled = 0
-    unmatched = 0
-    for excel_row, state, class_code in missing_rows:
-        rate = policy_rates.get((state, class_code))
-        if rate is None:
-            unmatched += 1
-            log(
-                f"PDF rate not found for Expiring row {excel_row}: "
-                f"state={state or '<blank>'}, class={class_code or '<blank>'}"
-            )
-            continue
-        expiring_ws.Cells(excel_row, 8).Value = rate
-        filled += 1
-        log(
-            f"PDF fallback filled Expiring H{excel_row}: "
-            f"state={state}, class={class_code}, rate={rate}"
-        )
-
-    return filled, unmatched
+    return sum(1 for row in values if row[0] in (None, ""))
 
 
 def main():
@@ -631,15 +413,29 @@ def main():
         else:
             log("No lookup keys found in Expiring Dump B or F from row 3.")
 
-        # PDF fallback for rates that the B -> P lookup did not find.
-        # Match Expiring Dump F (State) + G (Class Code) against the newest
-        # downloaded policy PDF and write Rate Per $100 Remuneration into H.
-        pdf_filled_count, pdf_unmatched_count = (
-            fill_blank_expiring_rates_from_pdf(
-                expiring_ws,
-                template_last_row,
-            )
+        # Stage 1 indication: count rates still blank after Rates Payroll
+        # lookups. H is Manual Rate; K is All-In Fund Rate.
+        blank_h_count = count_blank_cells(
+            expiring_ws, 8, DEST_START_ROW, template_last_row
         )
+        blank_k_count = count_blank_cells(
+            expiring_ws, 11, DEST_START_ROW, template_last_row
+        )
+        log(
+            f"BLANK SUMMARY: Expiring Dump H (Manual Rate): "
+            f"{blank_h_count}"
+        )
+        log(
+            f"BLANK SUMMARY: Expiring Dump K (All-In Fund Rate): "
+            f"{blank_k_count}"
+        )
+        if blank_h_count:
+            log(
+                "NEXT STEP REQUIRED: run fill_manual_rates_from_pdf.py "
+                "after downloading the policy PDF."
+            )
+        else:
+            log("No PDF Manual Rate fallback is required for Column H.")
 
         # Save both edited workbooks.
         log("Saving Rates Payroll workbook...")
@@ -675,11 +471,11 @@ def main():
         log(f"Nonblank B keys with no P match: {missing_count_b}")
         log(f"F->H matches found for destination K: {match_count_f}")
         log(f"Nonblank F keys with no H match: {missing_count_f}")
-        log(f"Blank H rates filled from policy PDF: {pdf_filled_count}")
-        log(f"Blank H rates still unmatched after PDF: {pdf_unmatched_count}")
+        log(f"Blank H Manual Rates after Rates lookup: {blank_h_count}")
+        log(f"Blank K All-In Fund Rates after Rates lookup: {blank_k_count}")
         log("Expiring B -> Rates P -> Rates L -> Expiring H.")
         log("Expiring F -> Rates H -> Rates N -> Expiring K.")
-        log("SUCCESS: All three transfer/lookup steps completed.")
+        log("STAGE 1 SUCCESS: UW transfer and Rates Payroll lookups completed.")
 
     finally:
         if source_wb is not None:
