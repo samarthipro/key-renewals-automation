@@ -14,6 +14,7 @@ BASE_DIR = Path(r"C:\Users\Samarth\Documents\Key Risk automation")
 
 SOURCE_FILE = BASE_DIR / "UW" / "Lotus HR Inc Template 26-27 UW V2.xlsx"
 RATES_FILE = BASE_DIR / "Expiry" / "Rates Payroll.xlsx"
+QUOTE_FILE = BASE_DIR / "Quote" / "Q-279399_Lotus_HR_Inc_Master_v2.xlsx"
 TEMPLATE_FILE = (
     BASE_DIR
     / "template"
@@ -24,6 +25,8 @@ SOURCE_SHEET = "Master"
 RATES_SHEET = "Lotus Merged Payroll"
 DESTINATION_SHEET = "Master Comparision"
 EXPIRING_SHEET = "Expiring Dump (KeyRisk)"
+QUOTE_MASTER_SHEET = "KeyRisk_Renewal_Quote_Master"
+QUOTE_PIVOT_SHEET = "KeyRisk_Renewal_Pivot"
 
 HEADERS = [
     "Client Id",
@@ -37,12 +40,21 @@ HEADERS = [
 DEST_HEADER_ROW = 2
 DEST_START_ROW = 3
 DEST_START_COL = 3
+QUOTE_SOURCE_START_ROW = 2
+QUOTE_SOURCE_START_COL = 2  # B
+QUOTE_DEST_START_ROW = 2
+QUOTE_DEST_START_COL = 10   # J
 EXISTING_FORMULA_ROW = 83
 
 XL_UP = -4162
 XL_TO_LEFT = -4159
 XL_SHIFT_DOWN = -4121
 XL_CALCULATION_MANUAL = -4135
+XL_FORMULAS = -4123
+XL_PART = 2
+XL_BY_ROWS = 1
+XL_BY_COLUMNS = 2
+XL_PREVIOUS = 2
 
 
 def log(message):
@@ -113,10 +125,176 @@ def count_blank_cells(ws, column, start_row, last_row):
     return sum(1 for row in values if row[0] in (None, ""))
 
 
+def find_quote_source_sheet(workbook):
+    """Select the Quote sheet containing the most Classcode records in F."""
+    best_sheet = None
+    best_count = -1
+
+    for index in range(1, workbook.Worksheets.Count + 1):
+        sheet = workbook.Worksheets(index)
+        if sheet.Name.casefold() == "payroll comparison":
+            continue
+        try:
+            last_row, last_col = quote_data_bounds(sheet)
+        except ValueError:
+            continue
+
+        qualifying = 0
+        if last_col >= 6:
+            values = as_rows(
+                sheet.Range(
+                    sheet.Cells(QUOTE_SOURCE_START_ROW, 6),
+                    sheet.Cells(last_row, 6),
+                ).Value2
+            )
+            qualifying = sum(
+                1
+                for row in values
+                if "classcode" in normalize(row[0])
+            )
+
+        if qualifying > best_count:
+            best_sheet = sheet
+            best_count = qualifying
+
+    if best_sheet is None:
+        raise ValueError("No populated worksheet was found in the Quote workbook.")
+
+    log(
+        f"Using Quote source sheet {best_sheet.Name!r} "
+        f"({best_count} Classcode rows in Column F)."
+    )
+    return best_sheet
+
+
+def quote_data_bounds(ws):
+    """Return B2:last actual value/formula bounds, ignoring formatting."""
+    last_row_cell = ws.Cells.Find(
+        What="*",
+        After=ws.Cells(1, 1),
+        LookIn=XL_FORMULAS,
+        LookAt=XL_PART,
+        SearchOrder=XL_BY_ROWS,
+        SearchDirection=XL_PREVIOUS,
+        MatchCase=False,
+    )
+    last_col_cell = ws.Cells.Find(
+        What="*",
+        After=ws.Cells(1, 1),
+        LookIn=XL_FORMULAS,
+        LookAt=XL_PART,
+        SearchOrder=XL_BY_COLUMNS,
+        SearchDirection=XL_PREVIOUS,
+        MatchCase=False,
+    )
+    if last_row_cell is None or last_col_cell is None:
+        raise ValueError(f"Quote sheet {ws.Name!r} is empty.")
+
+    last_row = last_row_cell.Row
+    last_col = last_col_cell.Column
+    if last_row < QUOTE_SOURCE_START_ROW or last_col < QUOTE_SOURCE_START_COL:
+        raise ValueError(
+            f"Quote sheet {ws.Name!r} has no data block beginning at B2."
+        )
+    return last_row, last_col
+
+
+def clear_previous_quote_data(ws):
+    """Clear the prior contiguous data block whose top-left cell is J2."""
+    start = ws.Cells(QUOTE_DEST_START_ROW, QUOTE_DEST_START_COL)
+    if start.Value not in (None, ""):
+        region = start.CurrentRegion
+        region_last_row = region.Row + region.Rows.Count - 1
+        region_last_col = region.Column + region.Columns.Count - 1
+        clear_start_col = max(QUOTE_DEST_START_COL, region.Column)
+        if (
+            region_last_row >= QUOTE_DEST_START_ROW
+            and region_last_col >= clear_start_col
+        ):
+            ws.Range(
+                ws.Cells(QUOTE_DEST_START_ROW, clear_start_col),
+                ws.Cells(region_last_row, region_last_col),
+            ).ClearContents()
+
+
+def copy_quote_data_to_template(quote_wb, dest_wb):
+    """Copy Quote B2:last used cell into Quote Master beginning at J2."""
+    quote_ws = find_quote_source_sheet(quote_wb)
+    last_row, last_col = quote_data_bounds(quote_ws)
+    row_count = last_row - QUOTE_SOURCE_START_ROW + 1
+    column_count = last_col - QUOTE_SOURCE_START_COL + 1
+
+    source = quote_ws.Range(
+        quote_ws.Cells(QUOTE_SOURCE_START_ROW, QUOTE_SOURCE_START_COL),
+        quote_ws.Cells(last_row, last_col),
+    ).Value
+
+    try:
+        destination = dest_wb.Worksheets(QUOTE_MASTER_SHEET)
+    except Exception as exc:
+        raise ValueError(
+            f"Template sheet not found: {QUOTE_MASTER_SHEET}"
+        ) from exc
+
+    clear_previous_quote_data(destination)
+    target = destination.Range(
+        destination.Cells(QUOTE_DEST_START_ROW, QUOTE_DEST_START_COL),
+        destination.Cells(
+            QUOTE_DEST_START_ROW + row_count - 1,
+            QUOTE_DEST_START_COL + column_count - 1,
+        ),
+    )
+    target.Value = source
+
+    if target.Value != source:
+        raise RuntimeError(
+            "Quote transfer validation failed after writing to "
+            f"{QUOTE_MASTER_SHEET}!J2."
+        )
+
+    log(
+        f"Copied Quote B2:{quote_ws.Cells(last_row, last_col).Address(False, False)} "
+        f"to {QUOTE_MASTER_SHEET}!J2 "
+        f"({row_count} rows x {column_count} columns)."
+    )
+    return row_count, column_count
+
+
+def refresh_quote_pivots(dest_wb, excel):
+    """Refresh every pivot table on KeyRisk_Renewal_Pivot."""
+    try:
+        pivot_ws = dest_wb.Worksheets(QUOTE_PIVOT_SHEET)
+    except Exception as exc:
+        raise ValueError(
+            f"Template sheet not found: {QUOTE_PIVOT_SHEET}"
+        ) from exc
+
+    pivot_tables = pivot_ws.PivotTables()
+    pivot_count = pivot_tables.Count
+    if pivot_count < 1:
+        raise ValueError(
+            f"No pivot tables were found on {QUOTE_PIVOT_SHEET}."
+        )
+
+    for index in range(1, pivot_count + 1):
+        pivot = pivot_tables.Item(index)
+        pivot.PivotCache().Refresh()
+        pivot.RefreshTable()
+        log(f"Refreshed pivot table: {pivot.Name}")
+
+    try:
+        excel.CalculateFull()
+    except Exception:
+        pass
+    log(f"Refreshed {pivot_count} pivot table(s) on {QUOTE_PIVOT_SHEET}.")
+    return pivot_count
+
+
 def main():
     for path, label in (
         (SOURCE_FILE, "UW workbook"),
         (RATES_FILE, "Rates Payroll workbook"),
+        (QUOTE_FILE, "Quote workbook"),
         (TEMPLATE_FILE, "Template workbook"),
     ):
         if not path.exists():
@@ -134,6 +312,7 @@ def main():
     excel = None
     source_wb = None
     rates_wb = None
+    quote_wb = None
     dest_wb = None
     old_calculation = None
     old_screen = None
@@ -437,7 +616,19 @@ def main():
         else:
             log("No PDF Manual Rate fallback is required for Column H.")
 
-        # Save both edited workbooks.
+        # STEP 4: Quote workbook B2:last used cell -> Quote Master J2,
+        # then refresh all configured renewal pivot tables.
+        log("Opening Quote workbook read-only...")
+        quote_wb = excel.Workbooks.Open(
+            str(QUOTE_FILE), UpdateLinks=0, ReadOnly=True
+        )
+        quote_row_count, quote_column_count = copy_quote_data_to_template(
+            quote_wb,
+            dest_wb,
+        )
+        pivot_count = refresh_quote_pivots(dest_wb, excel)
+
+        # Save all edited workbooks.
         log("Saving Rates Payroll workbook...")
         rates_wb.Save()
 
@@ -473,9 +664,17 @@ def main():
         log(f"Nonblank F keys with no H match: {missing_count_f}")
         log(f"Blank H Manual Rates after Rates lookup: {blank_h_count}")
         log(f"Blank K All-In Fund Rates after Rates lookup: {blank_k_count}")
+        log(
+            f"Quote data copied to {QUOTE_MASTER_SHEET}!J2: "
+            f"{quote_row_count} rows x {quote_column_count} columns"
+        )
+        log(f"Renewal pivot tables refreshed: {pivot_count}")
         log("Expiring B -> Rates P -> Rates L -> Expiring H.")
         log("Expiring F -> Rates H -> Rates N -> Expiring K.")
-        log("STAGE 1 SUCCESS: UW transfer and Rates Payroll lookups completed.")
+        log(
+            "STAGE 1 SUCCESS: UW/Rates lookups, Quote transfer, and "
+            "pivot refresh completed."
+        )
 
     finally:
         if source_wb is not None:
@@ -487,6 +686,12 @@ def main():
         if rates_wb is not None:
             try:
                 rates_wb.Close(SaveChanges=True)
+            except Exception:
+                pass
+
+        if quote_wb is not None:
+            try:
+                quote_wb.Close(SaveChanges=False)
             except Exception:
                 pass
 

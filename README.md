@@ -10,8 +10,9 @@ The workflow currently covers:
 4. Preparing lookup keys from Lotus Merged Payroll in Rates Payroll.xlsx.
 5. Performing two separate lookups to populate Manual Rate (H) and All-In Fund Rate (K).
 6. Reporting remaining blank counts in Expiring Dump H and K at the end of Stage 1.
-7. Running the policy PDF Manual Rate fallback separately in Stage 2.
-8. Saving updated workbooks and reporting match statistics.
+7. Copying Quote data from B2 into `KeyRisk_Renewal_Quote_Master!J2` and refreshing `KeyRisk_Renewal_Pivot`.
+8. Running the policy PDF Manual Rate fallback separately in Stage 2.
+9. Saving updated workbooks and reporting match statistics.
 Workflow details
 1. UW data transfer
 Source: Lotus HR Inc Template 26-27 UW V2.xlsx, worksheet Master.
@@ -38,7 +39,10 @@ Second	Expiring Dump Column F matched against Rates Payroll Column H	Rates Payro
 
 The script uses the first occurrence when duplicate keys exist. Unmatched keys are left blank and included in summary counts.
 
-5. Policy PDF rate fallback (separate Stage 2)
+5. Quote transfer and pivot refresh
+Stage 1 opens `Q-279399_Lotus_HR_Inc_Master_v2.xlsx` read-only, identifies its Quote data worksheet, copies the populated rectangular block beginning at B2, and writes values into `KeyRisk_Renewal_Quote_Master` beginning at J2. It clears the prior contiguous J2 data block first, validates the write, and refreshes every pivot table on `KeyRisk_Renewal_Pivot`.
+
+6. Policy PDF rate fallback (separate Stage 2)
 `fill_manual_rates_from_pdf.py` processes only blank values in Expiring Dump Column H. It reads State from Column F and Class Code from Column G, selects the newest PDF in the local `downloads/` folder, extracts `Rate Per $100 of Remuneration`, and fills H when State and Class Code match exactly. Column K is reported but not changed by Stage 2. Rows not found in the PDF remain blank and are logged.
 Technology stack
 - Python 3
@@ -84,7 +88,7 @@ If rounded totals differ by no more than $1, the script prints `MATCH` and does 
 
 Main workflow
 1. Confirm all configured paths exist and close the workbooks in Excel.
-2. Run Stage 1 to transfer UW data, populate Manual Rate H and All-In Fund Rate K from Rates Payroll, and report blank counts:
+2. Run Stage 1 to transfer UW data, populate Manual Rate H and All-In Fund Rate K from Rates Payroll, report blank counts, copy the Quote data block from B2 into `KeyRisk_Renewal_Quote_Master!J2`, and refresh every pivot on `KeyRisk_Renewal_Pivot`:
 ```
 python uw_to_template_rates.py
 ```
