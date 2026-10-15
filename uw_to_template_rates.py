@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime
 import shutil
 import sys
+import time
 
 try:
     import win32com.client as win32
@@ -50,6 +51,7 @@ XL_UP = -4162
 XL_TO_LEFT = -4159
 XL_SHIFT_DOWN = -4121
 XL_CALCULATION_MANUAL = -4135
+XL_CALCULATION_AUTOMATIC = -4105
 XL_FORMULAS = -4123
 XL_PART = 2
 XL_BY_ROWS = 1
@@ -217,6 +219,56 @@ def clear_previous_quote_data(ws):
             ).ClearContents()
 
 
+def recalculate_lookup_keys(excel, dest_wb, master_ws, expiring_ws):
+    """Force formula-driven lookup keys to update while calculation is manual."""
+    log("Recalculating template formulas before reading lookup keys...")
+    try:
+        master_ws.Calculate()
+        expiring_ws.Calculate()
+        excel.CalculateFullRebuild()
+    except Exception as exc:
+        raise RuntimeError(
+            "Excel could not recalculate the template lookup formulas."
+        ) from exc
+
+    # Wait for Excel calculation to finish (0 = xlDone).
+    deadline = time.time() + 120
+    while excel.CalculationState != 0:
+        if time.time() >= deadline:
+            raise TimeoutError("Excel calculation did not finish within 120 seconds.")
+        time.sleep(0.2)
+    log("Template formula recalculation completed.")
+
+
+def resize_quote_master_table(destination, target):
+    """Resize an Excel table beginning at J2 so pivots include new rows."""
+    resized = 0
+    try:
+        tables = destination.ListObjects
+        for index in range(1, tables.Count + 1):
+            table = tables.Item(index)
+            table_range = table.Range
+            if (
+                table_range.Row == QUOTE_DEST_START_ROW
+                and table_range.Column == QUOTE_DEST_START_COL
+            ):
+                table.Resize(target)
+                resized += 1
+                log(
+                    f"Resized Quote Master table {table.Name} to "
+                    f"{target.Address(False, False)}."
+                )
+    except Exception as exc:
+        raise RuntimeError("Failed while resizing the Quote Master table.") from exc
+
+    if resized == 0:
+        log(
+            "No Excel table begins at Quote Master J2; copied range was "
+            "written, and existing pivot source configuration will be used."
+        )
+    return resized
+
+
 def copy_quote_data_to_template(quote_wb, dest_wb):
     """Copy Quote B2:last used cell into Quote Master beginning at J2."""
     quote_ws = find_quote_source_sheet(quote_wb)
@@ -245,6 +297,7 @@ def copy_quote_data_to_template(quote_wb, dest_wb):
         ),
     )
     target.Value = source
+    resized_table_count = resize_quote_master_table(destination, target)
 
     if target.Value != source:
         raise RuntimeError(
@@ -257,11 +310,11 @@ def copy_quote_data_to_template(quote_wb, dest_wb):
         f"to {QUOTE_MASTER_SHEET}!J2 "
         f"({row_count} rows x {column_count} columns)."
     )
-    return row_count, column_count
+    return row_count, column_count, resized_table_count
 
 
 def refresh_quote_pivots(dest_wb, excel):
-    """Refresh every pivot table on KeyRisk_Renewal_Pivot."""
+    """Fully recalculate, refresh caches, and verify renewal pivot refreshes."""
     try:
         pivot_ws = dest_wb.Worksheets(QUOTE_PIVOT_SHEET)
     except Exception as exc:
@@ -276,18 +329,49 @@ def refresh_quote_pivots(dest_wb, excel):
             f"No pivot tables were found on {QUOTE_PIVOT_SHEET}."
         )
 
+    # Pivot refresh is more reliable with automatic calculation enabled.
+    excel.Calculation = XL_CALCULATION_AUTOMATIC
+    excel.CalculateFullRebuild()
+    try:
+        dest_wb.RefreshAll()
+        excel.CalculateUntilAsyncQueriesDone()
+    except Exception:
+        # Not all Excel versions expose async-query waiting; individual pivot
+        # cache refresh below is still required and verified.
+        pass
+
+    refreshed = 0
     for index in range(1, pivot_count + 1):
         pivot = pivot_tables.Item(index)
-        pivot.PivotCache().Refresh()
-        pivot.RefreshTable()
-        log(f"Refreshed pivot table: {pivot.Name}")
+        cache = pivot.PivotCache()
+        source_data = "<unavailable>"
+        try:
+            source_data = str(cache.SourceData)
+        except Exception:
+            pass
 
-    try:
-        excel.CalculateFull()
-    except Exception:
-        pass
-    log(f"Refreshed {pivot_count} pivot table(s) on {QUOTE_PIVOT_SHEET}.")
-    return pivot_count
+        cache.Refresh()
+        refresh_result = pivot.RefreshTable()
+        try:
+            pivot.Update()
+        except Exception:
+            pass
+
+        if refresh_result is False:
+            raise RuntimeError(f"Pivot refresh returned False: {pivot.Name}")
+        refreshed += 1
+        log(
+            f"Refreshed pivot table {pivot.Name}; "
+            f"source={source_data}"
+        )
+
+    excel.CalculateFullRebuild()
+    if refreshed != pivot_count:
+        raise RuntimeError(
+            f"Expected {pivot_count} pivot refreshes, completed {refreshed}."
+        )
+    log(f"Verified refresh for {refreshed} pivot table(s) on {QUOTE_PIVOT_SHEET}.")
+    return refreshed
 
 
 def main():
@@ -441,6 +525,11 @@ def main():
             f"D{DEST_START_ROW}:G{last_data_row}"
         ).Value = expiring_records
 
+        # Expiring Dump Column B is formula-driven from the transferred data.
+        # Calculation is currently manual for performance, so force it now
+        # before B is read as the Manual Rate lookup key.
+        recalculate_lookup_keys(excel, dest_wb, master_ws, expiring_ws)
+
         # STEP 3: Prepare Rates Payroll Column P and look up into Expiring Dump.
         log("Opening Rates Payroll workbook...")
         rates_wb = excel.Workbooks.Open(
@@ -545,6 +634,21 @@ def main():
                     expiring_ws.Cells(template_last_row, 6)
                 ).Value2
             )
+            nonblank_b_keys = sum(
+                1 for row in template_keys if make_lookup_key(row[0])
+            )
+            nonblank_f_keys = sum(
+                1 for row in template_keys if make_lookup_key(row[4])
+            )
+            log(
+                f"Calculated Expiring lookup keys: "
+                f"B nonblank={nonblank_b_keys}, F nonblank={nonblank_f_keys}"
+            )
+            if nonblank_b_keys == 0:
+                log(
+                    "WARNING: Expiring Dump Column B contains no calculated "
+                    "keys; Column H cannot match Rates Payroll Column P."
+                )
 
             output_h = []
             output_k = []
@@ -622,27 +726,33 @@ def main():
         quote_wb = excel.Workbooks.Open(
             str(QUOTE_FILE), UpdateLinks=0, ReadOnly=True
         )
-        quote_row_count, quote_column_count = copy_quote_data_to_template(
-            quote_wb,
-            dest_wb,
+        quote_row_count, quote_column_count, resized_table_count = (
+            copy_quote_data_to_template(
+                quote_wb,
+                dest_wb,
+            )
         )
         pivot_count = refresh_quote_pivots(dest_wb, excel)
 
-        # Save all edited workbooks.
+        # Validate the complete D:G transfer before either edited workbook is
+        # saved. A failed run is closed without saving in the finally block.
+        master_transfer = master_ws.Range(
+            f"D{DEST_START_ROW}:G{last_data_row}"
+        ).Value
+        expiring_transfer = expiring_ws.Range(
+            f"D{DEST_START_ROW}:G{last_data_row}"
+        ).Value
+        if master_transfer != expiring_transfer:
+            raise RuntimeError(
+                "Validation failed: Expiring Dump D:G does not fully match "
+                "Master Comparision D:G."
+            )
+
         log("Saving Rates Payroll workbook...")
         rates_wb.Save()
 
-        log("Saving template workbook...")
+        log("Saving template workbook after pivot refresh...")
         dest_wb.Save()
-
-        # Validate the D:G transfer from Step 2.
-        first_master = master_ws.Range("D3:G3").Value
-        first_expiring = expiring_ws.Range("D3:G3").Value
-        if first_master != first_expiring:
-            raise RuntimeError(
-                "Validation failed: first row in Expiring Dump "
-                "does not match Master Comparision."
-            )
 
         log(f"Validation passed: {count} rows copied to Master Comparision.")
         log(f"Validation passed: {count} rows copied to Expiring Dump D:G.")
@@ -668,6 +778,7 @@ def main():
             f"Quote data copied to {QUOTE_MASTER_SHEET}!J2: "
             f"{quote_row_count} rows x {quote_column_count} columns"
         )
+        log(f"Quote Master Excel tables resized: {resized_table_count}")
         log(f"Renewal pivot tables refreshed: {pivot_count}")
         log("Expiring B -> Rates P -> Rates L -> Expiring H.")
         log("Expiring F -> Rates H -> Rates N -> Expiring K.")
@@ -685,7 +796,7 @@ def main():
 
         if rates_wb is not None:
             try:
-                rates_wb.Close(SaveChanges=True)
+                rates_wb.Close(SaveChanges=False)
             except Exception:
                 pass
 
@@ -697,7 +808,7 @@ def main():
 
         if dest_wb is not None:
             try:
-                dest_wb.Close(SaveChanges=True)
+                dest_wb.Close(SaveChanges=False)
             except Exception:
                 pass
 
