@@ -73,6 +73,15 @@ Scripts may contain local absolute paths such as:
 C:\Users\<username>\Documents\Key Risk automation
 Update the paths for your computer before running. A future improvement is to move paths into a local configuration file excluded from version control.
 Running the automation
+
+Payroll preflight check (run first)
+Before the main transfer, compare UW `Master` Column R against the Quote workbook's Column J for rows whose Column F contains `Classcode`:
+```
+python compare_payroll_totals.py
+```
+If totals match, the script prints `MATCH` and does not modify either workbook. If they differ, it backs up the Quote workbook and creates/replaces a `Payroll Comparison` sheet containing differences grouped by State and Class Code.
+
+Main workflow
 1. Save the approved script in your local scripts/ folder.
 2. Confirm that all configured file paths exist.
 3. Close the workbooks in Excel.
