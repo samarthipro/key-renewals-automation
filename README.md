@@ -40,9 +40,7 @@ Second	Expiring Dump Column F matched against Rates Payroll Column H	Rates Payro
 The script uses the first occurrence when duplicate keys exist. Unmatched keys are left blank and included in summary counts.
 
 5. Quote transfer and pivot refresh
-Stage 1 opens `Q-279399_Lotus_HR_Inc_Master_v2.xlsx` read-only, identifies its Quote data worksheet, copies the populated rectangular block beginning at B2, and writes values into `KeyRisk_Renewal_Quote_Master` beginning at J2. It clears the prior contiguous J2 data block first, validates the write, resizes an Excel table beginning at J2 when present, forces workbook calculation, and performs a full refresh plus verified refresh of every pivot table on `KeyRisk_Renewal_Pivot`.
-
-Before reading the Expiring Dump lookup keys, Stage 1 also forces a full Excel recalculation so formula-driven Column B values are current before the Rates Payroll lookup populates Manual Rate Column H.
+Stage 1 opens `Q-279399_Lotus_HR_Inc_Master_v2.xlsx` read-only, identifies its Quote data worksheet, copies the populated rectangular block beginning at B2, and writes values into `KeyRisk_Renewal_Quote_Master` beginning at J2. It clears the prior contiguous J2 data block first, validates the write, and refreshes every pivot table on `KeyRisk_Renewal_Pivot`.
 
 6. Policy PDF rate fallback (separate Stage 2)
 `fill_manual_rates_from_pdf.py` processes only blank values in Expiring Dump Column H. It reads State from Column F and Class Code from Column G, selects the newest PDF in the local `downloads/` folder, extracts `Rate Per $100 of Remuneration`, and fills H when State and Class Code match exactly. Column K is reported but not changed by Stage 2. Rows not found in the PDF remain blank and are logged.
