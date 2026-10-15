@@ -85,6 +85,16 @@ def as_rows(value):
     return list(value)
 
 
+def count_nonblank_values(value):
+    """Count nonblank cells in a scalar or two-dimensional COM value."""
+    return sum(
+        1
+        for row in as_rows(value)
+        for cell in row
+        if cell not in (None, "")
+    )
+
+
 def find_header_columns(ws, headers, header_row=1):
     last_col = ws.Cells(header_row, ws.Columns.Count).End(XL_TO_LEFT).Column
     found = {}
@@ -175,8 +185,21 @@ def copy_quote_block_and_refresh_pivot(quote_wb, template_wb):
     source_values = source_range.Value
     target_range.Value = source_values
 
-    if target_range.Value != source_values:
-        raise RuntimeError("Quote B2 to Quote Master J2 copy validation failed.")
+    # Excel COM may convert equivalent values between types (for example,
+    # empty string to None or date representations), so direct tuple equality
+    # is too strict. Verify that the same number of populated cells arrived.
+    source_nonblank = count_nonblank_values(source_values)
+    target_nonblank = count_nonblank_values(target_range.Value)
+    log(
+        f"Quote copy validation: source nonblank={source_nonblank}, "
+        f"destination nonblank={target_nonblank}"
+    )
+    if target_nonblank != source_nonblank:
+        raise RuntimeError(
+            "Quote B2 to Quote Master J2 copy validation failed: "
+            f"source has {source_nonblank} populated cells, destination has "
+            f"{target_nonblank}."
+        )
 
     log(
         f"Copied {source_ws.Name}!B2:{source_ws.Cells(last_row, last_col).Address(False, False)} "
@@ -188,6 +211,10 @@ def copy_quote_block_and_refresh_pivot(quote_wb, template_wb):
     pivot_count = pivot_tables.Count
     if pivot_count < 1:
         raise ValueError(f"No pivot table found on {QUOTE_PIVOT_SHEET}.")
+    log(
+        f"Quote copy validation passed. Refreshing {pivot_count} pivot "
+        f"table(s) on {QUOTE_PIVOT_SHEET}..."
+    )
 
     for index in range(1, pivot_count + 1):
         pivot = pivot_tables.Item(index)
@@ -504,11 +531,14 @@ def main():
 
         # Stage 1 indication: count rates still blank after Rates Payroll
         # lookups. H is Manual Rate; K is All-In Fund Rate.
+        # Count blanks only across this run's imported UW records (rows 3 to
+        # last_data_row). Formula-filled Column B can extend much farther down
+        # and must not inflate the H/K blank summary.
         blank_h_count = count_blank_cells(
-            expiring_ws, 8, DEST_START_ROW, template_last_row
+            expiring_ws, 8, DEST_START_ROW, last_data_row
         )
         blank_k_count = count_blank_cells(
-            expiring_ws, 11, DEST_START_ROW, template_last_row
+            expiring_ws, 11, DEST_START_ROW, last_data_row
         )
         log(
             f"BLANK SUMMARY: Expiring Dump H (Manual Rate): "
@@ -565,7 +595,11 @@ def main():
             "Unique F->H lookup keys (return N): "
             f"{len(lookup_f_to_n)}"
         )
-        log(f"Expiring Dump rows checked: {max(0, template_last_row - 2)}")
+        log(
+            f"Expiring Dump lookup rows processed: "
+            f"{max(0, template_last_row - 2)}"
+        )
+        log(f"Current imported rows used for blank summary: {count}")
         log(f"B->P matches found for destination H: {match_count_b}")
         log(f"Nonblank B keys with no P match: {missing_count_b}")
         log(f"F->H matches found for destination K: {match_count_f}")
