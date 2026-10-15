@@ -8,9 +8,10 @@ The workflow currently covers:
 2. Transferring selected UW fields into Master Comparision.
 3. Copying required fields into Expiring Dump (KeyRisk).
 4. Preparing lookup keys from Lotus Merged Payroll in Rates Payroll.xlsx.
-5. Performing two separate lookups to populate Expiring Dump output columns.
-6. Filling unmatched rates from the downloaded policy PDF by State and Class Code.
-7. Saving updated workbooks and reporting match statistics.
+5. Performing two separate lookups to populate Manual Rate (H) and All-In Fund Rate (K).
+6. Reporting remaining blank counts in Expiring Dump H and K at the end of Stage 1.
+7. Running the policy PDF Manual Rate fallback separately in Stage 2.
+8. Saving updated workbooks and reporting match statistics.
 Workflow details
 1. UW data transfer
 Source: Lotus HR Inc Template 26-27 UW V2.xlsx, worksheet Master.
@@ -37,8 +38,8 @@ Second	Expiring Dump Column F matched against Rates Payroll Column H	Rates Payro
 
 The script uses the first occurrence when duplicate keys exist. Unmatched keys are left blank and included in summary counts.
 
-5. Policy PDF rate fallback
-For blank values in Expiring Dump Column H, the script reads State from Column F and Class Code from Column G. It selects the newest PDF in the local `downloads/` folder, extracts the table column headed `Rate Per $100 of Remuneration`, and fills H when the PDF State and Class Code match exactly. Rows not found in the PDF remain blank and are logged.
+5. Policy PDF rate fallback (separate Stage 2)
+`fill_manual_rates_from_pdf.py` processes only blank values in Expiring Dump Column H. It reads State from Column F and Class Code from Column G, selects the newest PDF in the local `downloads/` folder, extracts `Rate Per $100 of Remuneration`, and fills H when State and Class Code match exactly. Column K is reported but not changed by Stage 2. Rows not found in the PDF remain blank and are logged.
 Technology stack
 - Python 3
 - Microsoft Excel desktop
@@ -60,10 +61,10 @@ requirements.txt includes:
 - pdfplumber>=0.11
 Suggested project structure
 key-renewals-automation/
-├── scripts/
-│   └── key_renewals_combined_with_rates_lookup.py
-├── docs/
-│   └── workflow.md
+├── compare_payroll_totals.py
+├── uw_to_template_rates.py
+├── fill_manual_rates_from_pdf.py
+├── epic_chrome_worker.py
 ├── .gitignore
 ├── requirements.txt
 └── README.md
@@ -82,11 +83,17 @@ python compare_payroll_totals.py
 If rounded totals differ by no more than $1, the script prints `MATCH` and does not modify either workbook. If they differ by more than $1, it backs up the Quote workbook and creates/replaces a `Payroll Comparison` sheet containing whole-dollar differences grouped by State and Class Code; grouped differences of $1 or less are omitted.
 
 Main workflow
-1. Save the approved script in your local scripts/ folder.
-2. Confirm that all configured file paths exist.
-3. Close the workbooks in Excel.
-4. Run from Anaconda Prompt or a Windows terminal, using the exact script filename:
-python "scripts\key_renewals_combined_with_rates_lookup.py"
+1. Confirm all configured paths exist and close the workbooks in Excel.
+2. Run Stage 1 to transfer UW data, populate Manual Rate H and All-In Fund Rate K from Rates Payroll, and report blank counts:
+```
+python uw_to_template_rates.py
+```
+3. If Stage 1 reports blank Manual Rates in H, download the policy PDF and run Stage 2:
+```
+python fill_manual_rates_from_pdf.py
+```
+Stage 2 fills only blank H cells from PDF State/Class matches and reports the remaining H blanks plus unchanged K blanks.
+
 Test with copies of the workbooks first and verify the results before using them in a live renewal workflow.
 Validation and troubleshooting
 - Confirm worksheet names and header/data start rows.
@@ -106,7 +113,7 @@ Roadmap
 - [ ] Create test workbooks with synthetic, non-sensitive data.
 - [ ] Produce a sanitized report of matched and unmatched keys.
 - [ ] Improve formula-row handling and validation.
-- [ ] Separate the workflow into step-specific scripts.
+- [x] Separate Rates Payroll and PDF fallback into stage-specific scripts.
 - [ ] Add a main.py orchestrator after the individual steps are stable.
 - [ ] Add automated tests for lookup and data-validation logic.
 Status
