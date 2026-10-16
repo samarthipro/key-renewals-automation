@@ -121,156 +121,6 @@ def parse_nonnegative_number(value):
     return number if number >= 0 and number != float("inf") else None
 
 
-def expense_records_from_lines(lines):
-    """Extract all labeled values from rows without crossing into other fields."""
-    records = []
-    amount_label_count = 0
-    state_label_count = 0
-
-    for line in lines:
-        labels = []
-        for match in EXPENSE_CONSTANT_STATE_LABEL.finditer(line):
-            labels.append((match.start(), match.end(), "state"))
-            state_label_count += 1
-        for match in EXPENSE_CONSTANT_LABEL.finditer(line):
-            labels.append((match.start(), match.end(), "amount"))
-            amount_label_count += 1
-        labels.sort(key=lambda item: item[0])
-
-        # A flattened table can contain more than one labeled field on a row.
-        # Limit each value search to the text before the next label so an
-        # unrelated class code, payroll, or premium cannot be used.
-        for index, (_, label_end, record_type) in enumerate(labels):
-            value_end = labels[index + 1][0] if index + 1 < len(labels) else None
-            value_text = line[label_end:value_end]
-            if record_type == "state":
-                match = STATE_VALUE_PATTERN.search(value_text)
-                state = normalize_state(match.group(1) if match else None)
-                if state:
-                    records.append(("state", state))
-            else:
-                match = EXPENSE_NUMBER_PATTERN.search(value_text)
-                amount = parse_nonnegative_number(match.group(1) if match else None)
-                if amount is not None:
-                    records.append(("amount", amount))
-
-    return records, amount_label_count, state_label_count
-
-
-def values_match(left, right):
-    """Compare normalized numeric or text PDF values."""
-    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-        return abs(float(left) - float(right)) <= 0.0000001
-    return left == right
-
-
-def collapse_unbalanced_duplicate_records(records):
-    """Remove repeated text-layer records only from the overrepresented type."""
-    amount_count = sum(1 for record_type, _ in records if record_type == "amount")
-    state_count = sum(1 for record_type, _ in records if record_type == "state")
-    if amount_count == state_count:
-        return list(records)
-
-    duplicate_type = "amount" if amount_count > state_count else "state"
-    removals_needed = abs(amount_count - state_count)
-    removals = 0
-    previous_value = None
-    have_previous = False
-    normalized = []
-
-    for record_type, value in records:
-        if record_type != duplicate_type:
-            normalized.append((record_type, value))
-            continue
-
-        if (
-            removals < removals_needed
-            and have_previous
-            and values_match(previous_value, value)
-        ):
-            removals += 1
-            continue
-
-        normalized.append((record_type, value))
-        previous_value = value
-        have_previous = True
-
-    return normalized
-
-
-def pair_expense_records(records, source):
-    """Pair amounts and states from alternating or grouped PDF layouts."""
-    raw_amount_count = sum(
-        1 for record_type, _ in records if record_type == "amount"
-    )
-    raw_state_count = sum(
-        1 for record_type, _ in records if record_type == "state"
-    )
-    normalized_records = list(records)
-    if raw_amount_count != raw_state_count:
-        normalized_records = collapse_unbalanced_duplicate_records(records)
-
-    record_types = [record_type for record_type, _ in normalized_records]
-    amounts = [
-        value
-        for record_type, value in normalized_records
-        if record_type == "amount"
-    ]
-    states = [
-        value
-        for record_type, value in normalized_records
-        if record_type == "state"
-    ]
-
-    if len(normalized_records) != len(records):
-        log(
-            f"Collapsed duplicate PDF text-layer labels in {source}: "
-            f"{raw_amount_count} amount(s) / {raw_state_count} state(s) became "
-            f"{len(amounts)} amount(s) / {len(states)} state(s)."
-        )
-
-    # Some PDFs extract all Expense Constant rows first and all Applied-to
-    # rows afterward instead of alternating them. Support strictly alternating
-    # labels and exactly two homogeneous blocks, but reject mixed sequences
-    # because their amount/state relationship is ambiguous.
-    is_alternating = all(
-        record_types[index] != record_types[index - 1]
-        for index in range(1, len(record_types))
-    )
-    transitions = sum(
-        record_types[index] != record_types[index - 1]
-        for index in range(1, len(record_types))
-    )
-    is_grouped = transitions == 1
-    if record_types and not (is_alternating or is_grouped):
-        raise ValueError(
-            f"Expense Constant values and states have an ambiguous order in {source}."
-        )
-
-    # Preserve order within each label type and pair first amount to first
-    # state, second to second, and so on. Unequal counts remain unsafe and fail
-    # before Excel is opened.
-    if len(amounts) != len(states):
-        raise ValueError(
-            f"Found {len(amounts)} Expense Constant value(s) but "
-            f"{len(states)} Applied-to state(s) in {source}."
-        )
-    if not amounts:
-        raise ValueError(f"No complete Expense Constant pairs were found in {source}.")
-
-    constants = {}
-    for amount, state in zip(amounts, states):
-        existing = constants.get(state)
-        if existing is not None and abs(existing - amount) > 0.0000001:
-            raise ValueError(
-                f"Conflicting Expense Constant values for {state} in "
-                f"{source}: {existing} and {amount}"
-            )
-        constants[state] = amount
-
-    return constants
-
-
 def merge_expense_constants(target, additions, source):
     """Merge independently extracted representations without hiding conflicts."""
     for state, amount in additions.items():
@@ -283,84 +133,116 @@ def merge_expense_constants(target, additions, source):
         target[state] = amount
 
 
+def is_workers_comp_totals_page(text):
+    """Identify the totals worksheet that owns the requested summary fields."""
+    normalized = " ".join(text.split()).casefold()
+    return (
+        "workers compensation totals worksheet" in normalized
+        or "workers compensation 5.0 totals" in normalized
+    )
+
+
+def extract_adjacent_expense_pairs(lines, source):
+    """Read only an Expense Constant directly paired with its Applied-to row."""
+    constants = {}
+
+    for line_index, line in enumerate(lines):
+        amount_label = EXPENSE_CONSTANT_LABEL.search(line)
+        if not amount_label:
+            continue
+
+        # Usually both labels are separate consecutive rows, as displayed on
+        # the Workers Compensation Totals Worksheet. Also tolerate a table
+        # extractor flattening both rows into one line.
+        state_line = None
+        state_label = EXPENSE_CONSTANT_STATE_LABEL.search(
+            line, amount_label.end()
+        )
+        amount_end = state_label.start() if state_label else None
+        if state_label:
+            state_line = line
+        else:
+            next_index = line_index + 1
+            while next_index < len(lines) and not lines[next_index].strip():
+                next_index += 1
+            if next_index >= len(lines):
+                continue
+            state_line = lines[next_index]
+            state_label = EXPENSE_CONSTANT_STATE_LABEL.search(state_line)
+            if not state_label:
+                # This Expense Constant belongs to some other PDF section.
+                continue
+
+        amount_match = EXPENSE_NUMBER_PATTERN.search(
+            line[amount_label.end():amount_end]
+        )
+        state_match = STATE_VALUE_PATTERN.search(state_line[state_label.end():])
+        amount = parse_nonnegative_number(
+            amount_match.group(1) if amount_match else None
+        )
+        state = normalize_state(state_match.group(1) if state_match else None)
+        if amount is None or not state:
+            raise ValueError(
+                f"Found the adjacent Expense Constant rows in {source}, but "
+                "their amount or Applied-to state was unreadable."
+            )
+
+        existing = constants.get(state)
+        if existing is not None and abs(existing - amount) > 0.0000001:
+            raise ValueError(
+                f"Conflicting adjacent Expense Constant values for {state} "
+                f"in {source}: {existing} and {amount}"
+            )
+        constants[state] = amount
+
+    return constants
+
+
 def extract_expense_constants(pdf_path):
-    """Extract every Expense Constant and Applied-to state pair from a PDF."""
-    text_lines = []
-    table_lines = []
+    """Extract adjacent Expense Constant pairs only from the totals worksheet."""
+    constants = {}
 
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text_lines.extend(page_layout_text(page).splitlines())
-            for table in page.extract_tables() or []:
-                for row in table or []:
-                    if row:
-                        table_lines.append(
-                            " ".join(
-                                "" if cell is None else str(cell).strip()
-                                for cell in row
+        for page_number, page in enumerate(pdf.pages, start=1):
+            text = page_layout_text(page)
+            if not is_workers_comp_totals_page(text):
+                continue
+
+            source = f"{pdf_path}, totals page {page_number}"
+            page_constants = extract_adjacent_expense_pairs(
+                text.splitlines(), source
+            )
+
+            # Use table rows only when layout text did not expose the adjacent
+            # pair. Do not collect unrelated Expense Constant labels elsewhere.
+            if not page_constants:
+                table_lines = []
+                for table in page.extract_tables() or []:
+                    for row in table or []:
+                        if row:
+                            table_lines.append(
+                                " ".join(
+                                    "" if cell is None else str(cell).strip()
+                                    for cell in row
+                                )
                             )
-                        )
+                page_constants = extract_adjacent_expense_pairs(
+                    table_lines, f"{source} table"
+                )
 
-    source = str(pdf_path)
-    constants = {}
-    found_label = False
-    extraction_errors = []
-
-    # Reconcile table and layout-text representations. A malformed duplicate
-    # text layer must not override a complete table representation (or vice
-    # versa); independently complete representations must still agree.
-    for representation, lines in (
-        ("PDF tables", table_lines),
-        ("PDF layout text", text_lines),
-    ):
-        records, amount_count, state_count = expense_records_from_lines(lines)
-        if amount_count == 0 and state_count == 0:
-            continue
-        found_label = True
-        parsed_amount_count = sum(
-            1 for record_type, _ in records if record_type == "amount"
-        )
-        parsed_state_count = sum(
-            1 for record_type, _ in records if record_type == "state"
-        )
-        if (
-            parsed_amount_count != amount_count
-            or parsed_state_count != state_count
-        ):
-            extraction_errors.append(
-                f"{representation} contained {amount_count} amount label(s) "
-                f"and {state_count} state label(s), but only "
-                f"{parsed_amount_count} amount value(s) and "
-                f"{parsed_state_count} state value(s) were readable"
+            merge_expense_constants(
+                constants, page_constants, f"totals page {page_number}"
             )
-            continue
 
-        try:
-            extracted = pair_expense_records(
-                records, f"{source} ({representation})"
-            )
-        except ValueError as error:
-            extraction_errors.append(str(error))
-            continue
-
-        merge_expense_constants(constants, extracted, representation)
-
-    if not found_label:
-        raise ValueError(f"No Expense Constant entries were found in: {pdf_path}")
     if not constants:
-        details = "; ".join(extraction_errors) or "labels and values were incomplete"
         raise ValueError(
-            f"Could not safely pair every Expense Constant in {pdf_path}: {details}"
-        )
-    if extraction_errors:
-        log(
-            "Ignored one incomplete PDF representation because another "
-            "representation produced complete Expense Constant pairs: "
-            + "; ".join(extraction_errors)
+            "Could not find an adjacent 'Expense Constant' and "
+            f"'Expense Constant Applied to' pair on the Workers Compensation "
+            f"Totals Worksheet in: {pdf_path}"
         )
 
     for state, amount in constants.items():
-        log(f"Expense Constant found: {state} -> {amount:g}")
+        log(f"Expense Constant found on Totals Worksheet: {state} -> {amount:g}")
     return constants
 
 
