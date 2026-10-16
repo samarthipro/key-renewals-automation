@@ -56,7 +56,8 @@ TEMPLATE_FILE = (
 
 MASTER_SHEET = "Master Comparision"
 DATA_START_ROW = 3
-RECORD_COLUMN = 3         # C
+RECORD_FIRST_COLUMN = 3   # C
+RECORD_LAST_COLUMN = 8    # H
 STATE_COLUMN = 6          # F
 PAYROLL_COLUMN = 8        # H
 EXPIRING_EMOD_COLUMN = 9  # I
@@ -404,8 +405,81 @@ def worksheet_by_name(workbook, name):
     return None
 
 
+def has_meaningful_value(value):
+    """Treat None, empty strings, and whitespace-only text as blank."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def find_last_master_record_row(sheet):
+    """Find the last real imported record across C:H, excluding formula rows."""
+    scan_ceiling = max(
+        sheet.Cells(sheet.Rows.Count, column).End(XL_UP).Row
+        for column in range(RECORD_FIRST_COLUMN, RECORD_LAST_COLUMN + 1)
+    )
+
+    for row in range(scan_ceiling, DATA_START_ROW - 1, -1):
+        cells = [
+            sheet.Cells(row, column)
+            for column in range(RECORD_FIRST_COLUMN, RECORD_LAST_COLUMN + 1)
+        ]
+        # Stage 1 imports C:H as values. Formula/total rows (such as row 87)
+        # are not Master Comparision records even when they display totals.
+        if any(bool(cell.HasFormula) for cell in cells):
+            continue
+        if any(has_meaningful_value(cell.Value2) for cell in cells):
+            return row
+
+    raise ValueError("No actual Master Comparision records found in Columns C:H.")
+
+
+def clear_stale_emods_after_records(sheet, last_record_row):
+    """Clear old literal I/O values below records without touching totals rows."""
+    cleanup_ceiling = max(
+        sheet.Cells(sheet.Rows.Count, column).End(XL_UP).Row
+        for column in range(RECORD_FIRST_COLUMN, EXPENSE_CONSTANT_COLUMN + 1)
+    )
+    cleared_addresses = []
+
+    for row in range(last_record_row + 1, cleanup_ceiling + 1):
+        record_cells = [
+            sheet.Cells(row, column)
+            for column in range(RECORD_FIRST_COLUMN, RECORD_LAST_COLUMN + 1)
+        ]
+        # Stop before another record block or the formula/totals row. The
+        # totals row has values/formulas in C:H (Payroll total in H), while
+        # blank template rows may legitimately contain formulas in J:W.
+        if any(bool(cell.HasFormula) for cell in record_cells) or any(
+            has_meaningful_value(cell.Value2) for cell in record_cells
+        ):
+            log(f"Stopped stale E-Mod cleanup before protected row {row}.")
+            break
+
+        for column, column_letter in (
+            (EXPIRING_EMOD_COLUMN, "I"),
+            (QUOTE_EMOD_COLUMN, "O"),
+        ):
+            cell = sheet.Cells(row, column)
+            if bool(cell.HasFormula) or not has_meaningful_value(cell.Value2):
+                continue
+            cell.ClearContents()
+            if has_meaningful_value(cell.Value2):
+                raise RuntimeError(
+                    f"Could not clear stale E-Mod value at {column_letter}{row}."
+                )
+            cleared_addresses.append(f"{column_letter}{row}")
+
+    if cleared_addresses:
+        log("Cleared stale E-Mod values: " + ", ".join(cleared_addresses))
+    else:
+        log("No stale E-Mod values found below the final record.")
+
+
 def write_and_validate_emods(sheet, last_row, expiring_emod, quote_emod):
-    """Fill I and O over every active Column C record and validate results."""
+    """Fill I and O through the final actual C:H record and validate results."""
     expiring_range = sheet.Range(
         sheet.Cells(DATA_START_ROW, EXPIRING_EMOD_COLUMN),
         sheet.Cells(last_row, EXPIRING_EMOD_COLUMN),
@@ -576,12 +650,13 @@ def main():
         if sheet is None:
             raise ValueError(f"Sheet not found: {MASTER_SHEET}")
 
-        last_row = sheet.Cells(sheet.Rows.Count, RECORD_COLUMN).End(XL_UP).Row
-        if last_row < DATA_START_ROW:
-            raise ValueError("No Master Comparision records found in Column C.")
+        last_row = find_last_master_record_row(sheet)
 
         record_count = last_row - DATA_START_ROW + 1
-        log(f"Master Comparision records found: {record_count} (rows 3:{last_row})")
+        log(
+            f"Master Comparision actual records found: {record_count} "
+            f"(rows 3:{last_row})"
+        )
         log(f"Writing Expiring E-Mod {expiring_emod:.3f} to I3:I{last_row}")
         log(f"Writing Quote E-Mod {quote_emod:.3f} to O3:O{last_row}")
 
@@ -591,6 +666,7 @@ def main():
             expiring_emod,
             quote_emod,
         )
+        clear_stale_emods_after_records(sheet, last_row)
         log(
             f"Writing {len(expense_constants)} Expense Constant value(s) "
             "to Column W."
