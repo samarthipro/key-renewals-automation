@@ -157,11 +157,77 @@ def expense_records_from_lines(lines):
     return records, amount_label_count, state_label_count
 
 
+def values_match(left, right):
+    """Compare normalized numeric or text PDF values."""
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return abs(float(left) - float(right)) <= 0.0000001
+    return left == right
+
+
+def collapse_unbalanced_duplicate_records(records):
+    """Remove repeated text-layer records only from the overrepresented type."""
+    amount_count = sum(1 for record_type, _ in records if record_type == "amount")
+    state_count = sum(1 for record_type, _ in records if record_type == "state")
+    if amount_count == state_count:
+        return list(records)
+
+    duplicate_type = "amount" if amount_count > state_count else "state"
+    removals_needed = abs(amount_count - state_count)
+    removals = 0
+    previous_value = None
+    have_previous = False
+    normalized = []
+
+    for record_type, value in records:
+        if record_type != duplicate_type:
+            normalized.append((record_type, value))
+            continue
+
+        if (
+            removals < removals_needed
+            and have_previous
+            and values_match(previous_value, value)
+        ):
+            removals += 1
+            continue
+
+        normalized.append((record_type, value))
+        previous_value = value
+        have_previous = True
+
+    return normalized
+
+
 def pair_expense_records(records, source):
     """Pair amounts and states from alternating or grouped PDF layouts."""
-    record_types = [record_type for record_type, _ in records]
-    amounts = [value for record_type, value in records if record_type == "amount"]
-    states = [value for record_type, value in records if record_type == "state"]
+    raw_amount_count = sum(
+        1 for record_type, _ in records if record_type == "amount"
+    )
+    raw_state_count = sum(
+        1 for record_type, _ in records if record_type == "state"
+    )
+    normalized_records = list(records)
+    if raw_amount_count != raw_state_count:
+        normalized_records = collapse_unbalanced_duplicate_records(records)
+
+    record_types = [record_type for record_type, _ in normalized_records]
+    amounts = [
+        value
+        for record_type, value in normalized_records
+        if record_type == "amount"
+    ]
+    states = [
+        value
+        for record_type, value in normalized_records
+        if record_type == "state"
+    ]
+
+    if len(normalized_records) != len(records):
+        log(
+            f"Collapsed duplicate PDF text-layer labels in {source}: "
+            f"{raw_amount_count} amount(s) / {raw_state_count} state(s) became "
+            f"{len(amounts)} amount(s) / {len(states)} state(s)."
+        )
 
     # Some PDFs extract all Expense Constant rows first and all Applied-to
     # rows afterward instead of alternating them. Support strictly alternating
@@ -238,12 +304,11 @@ def extract_expense_constants(pdf_path):
     source = str(pdf_path)
     constants = {}
     found_label = False
-    maximum_expected_pairs = 0
-    maximum_complete_pairs = 0
     extraction_errors = []
 
-    # Reconcile table and layout-text representations. A partial text match
-    # must not suppress a complete table extraction (or vice versa).
+    # Reconcile table and layout-text representations. A malformed duplicate
+    # text layer must not override a complete table representation (or vice
+    # versa); independently complete representations must still agree.
     for representation, lines in (
         ("PDF tables", table_lines),
         ("PDF layout text", text_lines),
@@ -252,9 +317,24 @@ def extract_expense_constants(pdf_path):
         if amount_count == 0 and state_count == 0:
             continue
         found_label = True
-        maximum_expected_pairs = max(
-            maximum_expected_pairs, amount_count, state_count
+        parsed_amount_count = sum(
+            1 for record_type, _ in records if record_type == "amount"
         )
+        parsed_state_count = sum(
+            1 for record_type, _ in records if record_type == "state"
+        )
+        if (
+            parsed_amount_count != amount_count
+            or parsed_state_count != state_count
+        ):
+            extraction_errors.append(
+                f"{representation} contained {amount_count} amount label(s) "
+                f"and {state_count} state label(s), but only "
+                f"{parsed_amount_count} amount value(s) and "
+                f"{parsed_state_count} state value(s) were readable"
+            )
+            continue
+
         try:
             extracted = pair_expense_records(
                 records, f"{source} ({representation})"
@@ -263,16 +343,20 @@ def extract_expense_constants(pdf_path):
             extraction_errors.append(str(error))
             continue
 
-        complete_pairs = len(records) // 2
-        maximum_complete_pairs = max(maximum_complete_pairs, complete_pairs)
         merge_expense_constants(constants, extracted, representation)
 
     if not found_label:
         raise ValueError(f"No Expense Constant entries were found in: {pdf_path}")
-    if not constants or maximum_complete_pairs < maximum_expected_pairs:
+    if not constants:
         details = "; ".join(extraction_errors) or "labels and values were incomplete"
         raise ValueError(
             f"Could not safely pair every Expense Constant in {pdf_path}: {details}"
+        )
+    if extraction_errors:
+        log(
+            "Ignored one incomplete PDF representation because another "
+            "representation produced complete Expense Constant pairs: "
+            + "; ".join(extraction_errors)
         )
 
     for state, amount in constants.items():
