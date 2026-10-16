@@ -158,40 +158,50 @@ def expense_records_from_lines(lines):
 
 
 def pair_expense_records(records, source):
-    """Pair adjacent amount/state records and reject ambiguous PDF content."""
+    """Pair amounts and states from alternating or grouped PDF layouts."""
+    record_types = [record_type for record_type, _ in records]
+    amounts = [value for record_type, value in records if record_type == "amount"]
+    states = [value for record_type, value in records if record_type == "state"]
+
+    # Some PDFs extract all Expense Constant rows first and all Applied-to
+    # rows afterward instead of alternating them. Support strictly alternating
+    # labels and exactly two homogeneous blocks, but reject mixed sequences
+    # because their amount/state relationship is ambiguous.
+    is_alternating = all(
+        record_types[index] != record_types[index - 1]
+        for index in range(1, len(record_types))
+    )
+    transitions = sum(
+        record_types[index] != record_types[index - 1]
+        for index in range(1, len(record_types))
+    )
+    is_grouped = transitions == 1
+    if record_types and not (is_alternating or is_grouped):
+        raise ValueError(
+            f"Expense Constant values and states have an ambiguous order in {source}."
+        )
+
+    # Preserve order within each label type and pair first amount to first
+    # state, second to second, and so on. Unequal counts remain unsafe and fail
+    # before Excel is opened.
+    if len(amounts) != len(states):
+        raise ValueError(
+            f"Found {len(amounts)} Expense Constant value(s) but "
+            f"{len(states)} Applied-to state(s) in {source}."
+        )
+    if not amounts:
+        raise ValueError(f"No complete Expense Constant pairs were found in {source}.")
+
     constants = {}
-    pending_amount = None
-    pending_state = None
-
-    for record_type, value in records:
-        if record_type == "amount":
-            if pending_amount is not None:
-                raise ValueError(
-                    f"Found consecutive unpaired Expense Constant values in {source}."
-                )
-            pending_amount = value
-        else:
-            if pending_state is not None:
-                raise ValueError(
-                    f"Found consecutive unpaired expense-constant states in {source}."
-                )
-            pending_state = value
-
-        if pending_amount is None or pending_state is None:
-            continue
-
-        existing = constants.get(pending_state)
-        if existing is not None and abs(existing - pending_amount) > 0.0000001:
+    for amount, state in zip(amounts, states):
+        existing = constants.get(state)
+        if existing is not None and abs(existing - amount) > 0.0000001:
             raise ValueError(
-                f"Conflicting Expense Constant values for {pending_state} in "
-                f"{source}: {existing} and {pending_amount}"
+                f"Conflicting Expense Constant values for {state} in "
+                f"{source}: {existing} and {amount}"
             )
-        constants[pending_state] = pending_amount
-        pending_amount = None
-        pending_state = None
+        constants[state] = amount
 
-    if pending_amount is not None or pending_state is not None:
-        raise ValueError(f"Found an unpaired Expense Constant entry in {source}.")
     return constants
 
 
