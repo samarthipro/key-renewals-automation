@@ -548,14 +548,32 @@ def click_policies(page):
     log("Clicked Policies using its visible label.")
 
 
+def wait_and_open_policy(page, policy_code, timeout_seconds=20):
+    """Wait for the Policies grid to render, then open the exact policy."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        # Prefer an exact policy-number cell so another page label or a policy
+        # with a longer, similar number cannot be selected accidentally.
+        exact_matches = page.get_by_text(policy_code, exact=True)
+        if mouse_click_first_visible(
+            page, exact_matches, f"policy {policy_code}"
+        ):
+            return True
+        page.wait_for_timeout(500)
+    return False
+
+
 def open_policy_attachments(page, policy_code):
     """Open Policies, choose the requested policy, then open Attachments."""
     click_policies(page)
-    page.wait_for_timeout(3000)
 
-    policy_matches = page.get_by_text(policy_code, exact=False)
-    if not mouse_click_first_visible(page, policy_matches, f"policy {policy_code}"):
-        raise RuntimeError(f"Policy {policy_code!r} was not visible in Policies.")
+    # The first visit commonly paints the Policies shell before its rows. A
+    # fixed three-second delay made the initial job fail while a repeated job
+    # succeeded against the now-warmed grid.
+    if not wait_and_open_policy(page, policy_code):
+        raise RuntimeError(
+            f"Policy {policy_code!r} did not appear within 20 seconds."
+        )
     log(f"Opened policy: {policy_code}")
     page.wait_for_timeout(2000)
 
@@ -572,31 +590,35 @@ def open_policy_attachments(page, policy_code):
 
 
 def find_description_filter_input(page):
-    """Find the first attachment filter using the captured exact XPath."""
+    """Find the first filter input in the active Attachments program."""
+    # Epic keeps older programs in the DOM. Prefer the last visible program,
+    # which is the active screen, so a still-visible input from an older
+    # Attachments instance is not returned first.
+    programs = page.locator("root app program:visible")
+    try:
+        for index in range(programs.count() - 1, -1, -1):
+            controls = programs.nth(index).locator(
+                "filter-fields-form asi-combo-box input"
+            )
+            if controls.count() < 1:
+                continue
+            control = controls.first
+            if control.is_visible(timeout=500) and control.bounding_box():
+                return control
+    except Exception:
+        pass
+
+    # Absolute-path fallbacks for Epic versions where the active program's
+    # custom elements are not discoverable through the structural selector.
     xpaths = [
-        # Exact path captured from the live Attachments screen.
         "/html/body/root/app/program[3]/div/div[3]/div[2]/div/div/screen/div/div/div/proxy/div/asi-frame/div/div[2]/proxy[6]/div/asi-panel/div/proxy[3]/div/asi-virtual-list-view/div/filter-fields/div/filter-fields-form/div/asi-combo-box[1]/div/input",
-        # Program indexes can change between Epic screens/sessions.
         "/html/body/root/app/program[2]/div/div[3]/div[2]/div/div/screen/div/div/div/proxy/div/asi-frame/div/div[2]/proxy[6]/div/asi-panel/div/proxy[3]/div/asi-virtual-list-view/div/filter-fields/div/filter-fields-form/div/asi-combo-box[1]/div/input",
         "/html/body/root/app/program[1]/div/div[3]/div[2]/div/div/screen/div/div/div/proxy/div/asi-frame/div/div[2]/proxy[6]/div/asi-panel/div/proxy[3]/div/asi-virtual-list-view/div/filter-fields/div/filter-fields-form/div/asi-combo-box[1]/div/input",
     ]
     for xpath in xpaths:
         try:
             control = page.locator(f"xpath={xpath}")
-            if control.is_visible(timeout=500):
-                return control
-        except Exception:
-            continue
-
-    # Structural fallback independent of the current program number.
-    structural = page.locator(
-        "root app program:visible filter-fields-form "
-        "asi-combo-box:nth-of-type(1) input"
-    )
-    for index in range(structural.count()):
-        try:
-            control = structural.nth(index)
-            if control.is_visible(timeout=300):
+            if control.is_visible(timeout=500) and control.bounding_box():
                 return control
         except Exception:
             continue
@@ -604,24 +626,54 @@ def find_description_filter_input(page):
 
 
 def visible_search_inputs(page):
-    """Find and left-to-right sort inputs on the Attachments search row."""
-    labels = page.get_by_text("Search where", exact=True)
+    """Find left-to-right inputs on the active Attachments search row."""
+    scope = page
     label_box = None
-    for index in range(labels.count()):
-        try:
-            label = labels.nth(index)
-            if label.is_visible(timeout=300):
-                label_box = label.bounding_box()
-                if label_box:
-                    break
-        except Exception:
-            continue
+
+    # Search newest visible programs first; Epic retains older screens in the
+    # DOM and page-wide selectors can otherwise mix controls from two screens.
+    programs = page.locator("root app program:visible")
+    try:
+        program_indexes = range(programs.count() - 1, -1, -1)
+    except Exception:
+        program_indexes = ()
+
+    for program_index in program_indexes:
+        program = programs.nth(program_index)
+        labels = program.get_by_text("Search where", exact=True)
+        for label_index in range(labels.count()):
+            try:
+                label = labels.nth(label_index)
+                if label.is_visible(timeout=300):
+                    candidate_box = label.bounding_box()
+                    if candidate_box:
+                        scope = program
+                        label_box = candidate_box
+                        break
+            except Exception:
+                continue
+        if label_box is not None:
+            break
+
+    # Compatibility fallback when Epic does not expose a program wrapper.
+    if label_box is None:
+        labels = page.get_by_text("Search where", exact=True)
+        for index in range(labels.count()):
+            try:
+                label = labels.nth(index)
+                if label.is_visible(timeout=300):
+                    label_box = label.bounding_box()
+                    if label_box:
+                        break
+            except Exception:
+                continue
+
     if label_box is None:
         raise RuntimeError("The Attachments 'Search where' toolbar was not visible.")
 
     label_center_y = label_box["y"] + label_box["height"] / 2
     controls = []
-    inputs = page.locator("input")
+    inputs = scope.locator("input")
     for index in range(inputs.count()):
         candidate = inputs.nth(index)
         try:
@@ -643,11 +695,48 @@ def visible_search_inputs(page):
     return [candidate for _, candidate in controls]
 
 
-def choose_visible_dropdown_option(page, control, option, toolbar_bottom):
-    """Click an option only inside the dropdown aligned with its input."""
-    control_box = control.bounding_box()
-    if control_box is None:
-        return False
+def wait_for_attachment_toolbar(page, timeout_seconds=20):
+    """Wait until Epic exposes three stable attachment-search inputs."""
+    deadline = time.time() + timeout_seconds
+    previous_boxes = None
+    stable_observations = 0
+
+    while time.time() < deadline:
+        try:
+            controls = visible_search_inputs(page)
+            description = find_description_filter_input(page)
+            if len(controls) >= 3 and description is not None:
+                boxes = [description.bounding_box()]
+                boxes.extend(control.bounding_box() for control in controls[:3])
+                if all(box is not None for box in boxes):
+                    signature = tuple(
+                        (
+                            round(box["x"]),
+                            round(box["y"]),
+                            round(box["width"]),
+                            round(box["height"]),
+                        )
+                        for box in boxes
+                    )
+                    if signature == previous_boxes:
+                        stable_observations += 1
+                    else:
+                        previous_boxes = signature
+                        stable_observations = 1
+                    if stable_observations >= 2:
+                        return
+        except Exception:
+            previous_boxes = None
+            stable_observations = 0
+        page.wait_for_timeout(500)
+
+    raise RuntimeError(
+        "The Attachments search toolbar did not stabilize within 20 seconds."
+    )
+
+
+def choose_visible_dropdown_option(page, control_box, option, toolbar_bottom):
+    """Click an option inside the dropdown aligned with its original input."""
 
     matches = page.get_by_text(option, exact=True)
     candidates = []
@@ -697,6 +786,10 @@ def click_adjacent_dropdown_arrow(page, control, description):
     page.mouse.down()
     page.wait_for_timeout(100)
     page.mouse.up()
+    # Opening an Epic combo can replace its input node immediately. Return the
+    # pre-click geometry so option selection never asks the stale node for a
+    # new bounding box.
+    return box
 
 
 def dropdown_has_value(control, option):
@@ -747,8 +840,8 @@ def type_dropdown_value(page, control, option):
         return False
 
 
-def select_attachment_dropdown(page, control, option, toolbar_bottom):
-    """Select an attachment filter and verify its displayed input value."""
+def select_attachment_dropdown(page, option):
+    """Select an attachment filter, retrying after Epic replaces its input."""
 
     def fresh_control():
         if option.casefold() == "description":
@@ -756,46 +849,62 @@ def select_attachment_dropdown(page, control, option, toolbar_bottom):
         controls = visible_search_inputs(page)
         return controls[1] if len(controls) > 1 else None
 
-    current_control = fresh_control() or control
-    if dropdown_has_value(current_control, option):
-        log(f"Attachment filter dropdown already selected: {option}.")
-        return
-
-    menu_still_open = False
-    try:
-        click_adjacent_dropdown_arrow(page, current_control, option)
-        menu_still_open = True
-        page.wait_for_timeout(700)
-        if choose_visible_dropdown_option(
-            page, current_control, option, toolbar_bottom
-        ):
-            menu_still_open = False
+    # Epic commonly replaces the combo input as its menu opens. Retry with a
+    # newly located input, and use the geometry captured before the click when
+    # finding the option instead of querying the detached input afterward.
+    for attempt in range(1, 4):
+        current_control = fresh_control()
+        if current_control is None:
             page.wait_for_timeout(700)
-            current_control = fresh_control()
-            if current_control is not None and dropdown_has_value(
-                current_control, option
-            ):
-                log(f"Selected and verified attachment filter: {option}.")
-                return
-            log(
-                f"Clicked the dropdown's {option} option, but Epic did not "
-                "retain it; retrying with dropdown keyboard navigation."
+            continue
+        if dropdown_has_value(current_control, option):
+            log(f"Attachment filter dropdown already selected: {option}.")
+            return
+
+        try:
+            control_box = click_adjacent_dropdown_arrow(
+                page, current_control, option
             )
-    except Exception as error:
-        menu_still_open = False
-        log(f"Could not use the {option} dropdown arrow: {error}")
+            page.wait_for_timeout(700)
+            current_toolbar_bottom = control_box["y"] + control_box["height"]
+            if choose_visible_dropdown_option(
+                page, control_box, option, current_toolbar_bottom
+            ):
+                page.wait_for_timeout(700)
+                current_control = fresh_control()
+                if current_control is not None and dropdown_has_value(
+                    current_control, option
+                ):
+                    log(f"Selected and verified attachment filter: {option}.")
+                    return
+                log(
+                    f"Epic did not retain {option} after attempt {attempt}; "
+                    "reacquiring the filter control."
+                )
+            else:
+                log(
+                    f"The {option} option was not visible after attempt "
+                    f"{attempt}; reacquiring the filter control."
+                )
+        except Exception as error:
+            log(
+                f"Could not use the {option} dropdown on attempt "
+                f"{attempt}: {error}"
+            )
+
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        page.wait_for_timeout(700)
 
     if option.casefold() == "description":
         try:
-            # If text-location selection failed, its menu is still open. Do not
-            # touch the now-stale old input; select the fifth menu entry directly.
-            if not menu_still_open:
-                current_control = fresh_control()
-                if current_control is None:
-                    raise RuntimeError("Description input disappeared after re-render.")
-                click_adjacent_dropdown_arrow(page, current_control, option)
-                page.wait_for_timeout(500)
-
+            current_control = fresh_control()
+            if current_control is None:
+                raise RuntimeError("Description input disappeared after re-render.")
+            click_adjacent_dropdown_arrow(page, current_control, option)
+            page.wait_for_timeout(500)
             page.keyboard.press("Home")
             for _ in range(4):
                 page.keyboard.press("ArrowDown")
@@ -835,6 +944,9 @@ def select_attachment_dropdown(page, control, option, toolbar_bottom):
 
 def apply_policy_attachment_filter(page):
     """Set Description / Contains / policy and click Find."""
+    # The Attachments page can display its grid before the custom search
+    # controls finish rendering. Require stable control geometry first.
+    wait_for_attachment_toolbar(page)
     controls = visible_search_inputs(page)
     if len(controls) < 3:
         raise RuntimeError(
@@ -846,15 +958,11 @@ def apply_policy_attachment_filter(page):
     if description_control is None:
         raise RuntimeError("The exact first Description filter input was not visible.")
 
-    first_box = description_control.bounding_box()
-    toolbar_y = first_box["y"] + first_box["height"] if first_box else 0
-    select_attachment_dropdown(
-        page, description_control, "Description", toolbar_y
-    )
+    select_attachment_dropdown(page, "Description")
 
     # Re-query because selecting the first dropdown can re-render the toolbar.
     controls = visible_search_inputs(page)
-    select_attachment_dropdown(page, controls[1], "Contains", toolbar_y)
+    select_attachment_dropdown(page, "Contains")
 
     # Final verification: never run Find while Description is blank. Retry each
     # field once after all combo re-renders, then require both visible values.
@@ -867,14 +975,12 @@ def apply_policy_attachment_filter(page):
         description_control = find_description_filter_input(page)
         if description_control is None:
             raise RuntimeError("Description filter disappeared after re-render.")
-        select_attachment_dropdown(
-            page, description_control, "Description", toolbar_y
-        )
+        select_attachment_dropdown(page, "Description")
 
     controls = visible_search_inputs(page)
     if not dropdown_has_value(controls[1], "Contains"):
         log("Second filter became blank; forcing Contains again.")
-        select_attachment_dropdown(page, controls[1], "Contains", toolbar_y)
+        select_attachment_dropdown(page, "Contains")
 
     controls = visible_search_inputs(page)
     description_control = find_description_filter_input(page)
